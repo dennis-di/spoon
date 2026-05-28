@@ -45,7 +45,8 @@ async function injectLocationData(code: string, id: string): Promise<{ code: str
   try {
     const { transformWithLocation } = await import('./transform.js')
     return transformWithLocation(code, id)
-  } catch {
+  } catch (e) {
+    console.warn('[spoon] transform error:', e)
     return undefined
   }
 }
