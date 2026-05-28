@@ -1,0 +1,70 @@
+{
+  "name": "vite-plugin-spoon",
+  "version": "0.1.0",
+  "description": "Visual UI editor that writes changes back into real source files. Click any element in the browser, edit it, and watch the actual code bend.",
+  "keywords": [
+    "vite",
+    "vite-plugin",
+    "visual-editor",
+    "tailwind",
+    "write-back",
+    "inspector",
+    "dev-tools",
+    "react",
+    "source-map",
+    "ui-editor",
+    "design-system",
+    "css-tokens",
+    "hot-reload"
+  ],
+  "author": "Dennis DiBartolomeo",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "vite": ">=4.0.0"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.24.0",
+    "@babel/traverse": "^7.24.0",
+    "@babel/types": "^7.24.0"
+  },
+  "devDependencies": {
+    "@types/babel__traverse": "^7.20.6",
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/denti-rollmops/spoon.git"
+  },
+  "homepage": "https://github.com/denti-rollmops/spoon#readme",
+  "bugs": {
+    "url": "https://github.com/denti-rollmops/spoon/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
