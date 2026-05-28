@@ -15,6 +15,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   let active = false;
   let panel = null;
+  let currentEl = null;
+  let panelWidth = Number(localStorage.getItem('__spoon_w')) || 360;
   let tokens = { colors: [], spacing: [] };
 
   // ── Hotkey handling — matches on physical e.code so macOS' Alt-letter
@@ -52,6 +54,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   async function activate() {
     active = true;
     document.body.style.cursor = 'crosshair';
+    mountPanel();
     showToolbar();
     document.addEventListener('mouseover', onHover, true);
     document.addEventListener('click', onClick, true);
@@ -65,8 +68,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     active = false;
     document.body.style.cursor = '';
     clearHighlight();
-    hidePanel();
+    unmountPanel();
     hideToolbar();
+    currentEl = null;
     document.removeEventListener('mouseover', onHover, true);
     document.removeEventListener('click', onClick, true);
   }
@@ -139,71 +143,135 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     ];
   }
 
-  // ── Panel ─────────────────────────────────────────────────────────────
+  // ── Sidepanel (mounted once on activate, content swapped per selection) ─
 
-  function openPanel(el) {
-    hidePanel();
-    const loc = el.dataset.spoonLoc;
-    const [file, lineStr] = loc.split(':');
-    const line = Number(lineStr);
-
-    const rect = el.getBoundingClientRect();
+  function mountPanel() {
+    if (panel) return;
     panel = document.createElement('div');
     panel.id = '__spoon-panel';
     Object.assign(panel.style, {
-      position: 'fixed',
-      top: Math.min(rect.bottom + 8, window.innerHeight - 460) + 'px',
-      left: Math.max(Math.min(rect.left, window.innerWidth - 380), 8) + 'px',
-      width: '360px',
-      maxHeight: '70vh',
-      background: '#1e1e2e',
-      color: '#cdd6f4',
-      borderRadius: '10px',
-      boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      position: 'fixed', top: '0', right: '0', height: '100vh',
+      width: panelWidth + 'px',
+      background: '#1e1e2e', color: '#cdd6f4',
+      boxShadow: '-4px 0 24px rgba(0,0,0,0.4)',
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      fontSize: '12px',
-      zIndex: '2147483647',
-      overflow: 'hidden',
-      border: '1px solid #313244',
-      display: 'flex',
-      flexDirection: 'column',
+      fontSize: '12px', zIndex: '2147483647',
+      borderLeft: '1px solid #313244',
+      display: 'flex', flexDirection: 'column',
     });
 
+    panel.innerHTML =
+      headerHtml() +
+      '<div id="__spoon-body" style="overflow:auto;flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:14px;"></div>' +
+      footerHtml();
+
+    // Resize handle on the left edge
+    const grip = document.createElement('div');
+    Object.assign(grip.style, {
+      position: 'absolute', top: '0', left: '0',
+      width: '4px', height: '100%', cursor: 'ew-resize',
+      background: 'transparent',
+    });
+    grip.addEventListener('mousedown', startResize);
+    panel.appendChild(grip);
+
+    document.body.appendChild(panel);
+    document.body.style.transition = 'margin-right 0.15s ease';
+    document.body.style.marginRight = panelWidth + 'px';
+
+    panel.querySelector('#__spoon-close').onclick = deactivate;
+    panel.querySelector('#__spoon-cancel').onclick = cancelEdits;
+    panel.querySelector('#__spoon-apply').onclick = () => {
+      if (!currentEl) return;
+      applyEdits(currentEl);
+    };
+
+    showEmptyState();
+  }
+
+  function unmountPanel() {
+    panel?.remove();
+    panel = null;
+    document.body.style.marginRight = '';
+  }
+
+  function openPanel(el) {
+    if (!panel) mountPanel();
+    if (currentEl === el) return;
+
+    // If we're switching elements, revert any unsaved changes on the old one
+    if (currentEl && panel.dataset.origClass !== undefined) {
+      currentEl.className = panel.dataset.origClass;
+      if (panel.dataset.origText !== undefined && currentEl.firstChild) {
+        currentEl.firstChild.textContent = panel.dataset.origText;
+      }
+    }
+
+    currentEl = el;
     const initialClass = el.className || '';
     const initialText = el.childNodes.length === 1 && el.firstChild.nodeType === 3
       ? el.firstChild.textContent : null;
 
     panel.dataset.origClass = initialClass;
     if (initialText !== null) panel.dataset.origText = initialText;
+    else delete panel.dataset.origText;
 
-    panel.innerHTML = headerHtml(loc);
-    panel.insertAdjacentHTML('beforeend', '<div id="__spoon-body" style="overflow:auto;flex:1;padding:10px 12px;display:flex;flex-direction:column;gap:12px;"></div>');
-    panel.insertAdjacentHTML('beforeend', footerHtml());
-    document.body.appendChild(panel);
-
-    panel.querySelector('#__spoon-close').onclick = hidePanel;
-    panel.querySelector('#__spoon-cancel').onclick = () => {
-      el.className = initialClass;
-      if (initialText !== null && el.firstChild) el.firstChild.textContent = initialText;
-      hidePanel();
-    };
-    panel.querySelector('#__spoon-apply').onclick = () => applyEdits(el, file, line, initialClass, initialText);
-
+    panel.querySelector('#__spoon-loc').textContent = el.dataset.spoonLoc;
+    setStatus('');
     renderBody(el, initialText);
   }
 
-  function headerHtml(loc) {
-    return \`<div style="padding:9px 12px;background:#181825;display:flex;align-items:center;gap:8px;border-bottom:1px solid #313244;flex-shrink:0;">
+  function showEmptyState() {
+    const body = panel.querySelector('#__spoon-body');
+    body.innerHTML = '';
+    const hint = document.createElement('div');
+    Object.assign(hint.style, { color: '#585b70', fontSize: '12px', padding: '40px 0', textAlign: 'center' });
+    hint.textContent = 'Click any element to start editing';
+    body.appendChild(hint);
+    panel.querySelector('#__spoon-loc').textContent = '';
+  }
+
+  function cancelEdits() {
+    if (!currentEl) return;
+    currentEl.className = panel.dataset.origClass;
+    if (panel.dataset.origText !== undefined && currentEl.firstChild) {
+      currentEl.firstChild.textContent = panel.dataset.origText;
+    }
+    renderBody(currentEl, panel.dataset.origText ?? null);
+    setStatus('Reverted.');
+  }
+
+  function startResize(e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelWidth;
+    const onMove = (ev) => {
+      const next = Math.max(280, Math.min(720, startW + (startX - ev.clientX)));
+      panelWidth = next;
+      panel.style.width = next + 'px';
+      document.body.style.marginRight = next + 'px';
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      localStorage.setItem('__spoon_w', String(panelWidth));
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  function headerHtml() {
+    return \`<div style="padding:10px 14px;background:#181825;display:flex;align-items:center;gap:8px;border-bottom:1px solid #313244;flex-shrink:0;">
       <span style="color:#6366f1;font-weight:700">⟡ spoon</span>
-      <span style="flex:1;color:#585b70;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="\${esc(loc)}">\${esc(loc)}</span>
-      <button id="__spoon-close" style="background:none;border:none;color:#585b70;cursor:pointer;font-size:18px;line-height:1;padding:0">×</button>
+      <span id="__spoon-loc" style="flex:1;color:#585b70;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <button id="__spoon-close" style="background:none;border:none;color:#585b70;cursor:pointer;font-size:18px;line-height:1;padding:0" title="Close (Esc)">×</button>
     </div>\`;
   }
 
   function footerHtml() {
-    return \`<div style="padding:8px 12px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
+    return \`<div style="padding:10px 14px;background:#181825;border-top:1px solid #313244;display:flex;gap:6px;align-items:center;flex-shrink:0;">
       <div id="__spoon-status" style="flex:1;font-size:11px;color:#a6e3a1;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
-      <button id="__spoon-cancel" style="background:#313244;color:#cdd6f4;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:12px">Cancel</button>
+      <button id="__spoon-cancel" style="background:#313244;color:#cdd6f4;border:none;border-radius:5px;padding:6px 10px;cursor:pointer;font-size:12px">Revert</button>
       <button id="__spoon-apply" style="background:#6366f1;color:#fff;border:none;border-radius:5px;padding:6px 12px;cursor:pointer;font-size:12px;font-weight:600">Apply →</button>
     </div>\`;
   }
@@ -428,13 +496,19 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   // ── Apply (write-back) ────────────────────────────────────────────────
 
-  async function applyEdits(el, file, line, origClass, origText) {
+  async function applyEdits(el) {
+    const loc = el.dataset.spoonLoc;
+    const [file, lineStr] = loc.split(':');
+    const line = Number(lineStr);
+    const origClass = panel.dataset.origClass;
+    const origText = panel.dataset.origText;
+
     const patches = [];
     if (el.className !== origClass) {
       patches.push({ type: 'class-replace', line, oldValue: origClass, newValue: el.className });
     }
     const textInput = panel.querySelector('[data-role="text-input"]');
-    if (textInput && origText !== null && textInput.value !== origText) {
+    if (textInput && origText !== undefined && textInput.value !== origText) {
       patches.push({ type: 'text', line, oldValue: origText, newValue: textInput.value });
     }
     if (patches.length === 0) { setStatus('Nothing changed.'); return; }
@@ -449,7 +523,6 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       const data = await res.json();
       if (data.ok) {
         setStatus('✓ Saved → ' + file);
-        // Update originals so further edits patch against the new source
         panel.dataset.origClass = el.className;
         if (textInput) panel.dataset.origText = textInput.value;
       } else {
@@ -463,11 +536,6 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   function setStatus(msg) {
     const s = panel?.querySelector('#__spoon-status');
     if (s) s.textContent = msg;
-  }
-
-  function hidePanel() {
-    panel?.remove();
-    panel = null;
   }
 
   // ── Toolbar ───────────────────────────────────────────────────────────
