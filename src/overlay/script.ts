@@ -963,18 +963,27 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   // Find a custom (non-Tailwind) class that actually contributes the element's
   // background color or gradient — by temporarily removing each candidate and
   // checking whether the computed background changes.
+  // IMPORTANT: classList.remove/add reorders the class string (moves the class
+  // to the end), which would corrupt later className diffs. We snapshot the
+  // exact className and restore it verbatim afterwards.
   function findCustomBgClass(el) {
+    const original = el.getAttribute('class');
     const before = getComputedStyle(el);
     const beforeKey = before.backgroundColor + '|' + before.backgroundImage;
     const candidates = classList(el).filter((c) => !TW_SHAPE.test(c));
+    let found = null;
     for (const c of candidates) {
       el.classList.remove(c);
       const after = getComputedStyle(el);
       const afterKey = after.backgroundColor + '|' + after.backgroundImage;
       el.classList.add(c);
-      if (afterKey !== beforeKey) return c;
+      if (afterKey !== beforeKey) { found = c; break; }
     }
-    return null;
+    // Restore the exact original class string (order included)
+    if (original !== null && el.getAttribute('class') !== original) {
+      el.setAttribute('class', original);
+    }
+    return found;
   }
 
   function colorSection(el) {

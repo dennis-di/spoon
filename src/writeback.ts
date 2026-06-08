@@ -95,7 +95,7 @@ export function applyEditAtLocation(
   }
 
   if (op.style !== undefined) {
-    const r = styleEdit(openingNode, op.style.prop, op.style.value)
+    const r = styleEdit(openingNode, op.style.prop, op.style.value, source)
     if (r.error) return { ok: false, error: r.error }
     if (r.edit) edits.push(r.edit)
     prevStyle = { prop: op.style.prop, value: r.prev ?? '' }
@@ -125,6 +125,7 @@ function styleEdit(
   opening: t.JSXOpeningElement,
   prop: string,
   value: string,
+  fullSource: string,
 ): { edit?: { start: number; end: number; replacement: string }; prev?: string; error?: string } {
   const camel = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
 
@@ -160,6 +161,34 @@ function styleEdit(
 
   if (existing) {
     const v = existing.value
+
+    // Removing the property (value === '') — splice out the whole
+    // `prop: "..."` plus its trailing/leading comma so the object stays valid.
+    // Only static string values may be removed: deleting a dynamic value
+    // (e.g. a ternary that styles open/closed states) would silently destroy
+    // app behaviour, which Spoon never does. Dynamic → hands off.
+    if (value === '') {
+      if (!t.isStringLiteral(v)) {
+        return { error: `${prop} is set by a dynamic expression — edit it in source (or use a Claude task)` }
+      }
+      if (existing.start == null || existing.end == null) return { error: 'no range on style property' }
+      const prevVal = v.value
+      let start = existing.start
+      let end = existing.end
+      // Eat a trailing comma (and following whitespace) if present…
+      const after = fullSource.slice(end)
+      const trailingComma = after.match(/^\s*,/)
+      if (trailingComma) {
+        end += trailingComma[0].length
+      } else {
+        // …otherwise eat a preceding comma so we don't leave a dangling one.
+        const before = fullSource.slice(0, start)
+        const leadingComma = before.match(/,\s*$/)
+        if (leadingComma) start -= leadingComma[0].length
+      }
+      return { edit: { start, end, replacement: '' }, prev: prevVal }
+    }
+
     if (t.isStringLiteral(v)) {
       if (v.start == null || v.end == null) return { error: 'no range on style value' }
       return { edit: { start: v.start, end: v.end, replacement: JSON.stringify(value) }, prev: v.value }
