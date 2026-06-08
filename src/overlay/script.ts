@@ -1291,6 +1291,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   // override. Applies optimistically to the DOM, then persists.
   async function writeStyleProp(el, prop, value) {
     const { file, loc } = parseLoc(el.dataset.spoonLoc);
+    // Snapshot the inline style so we can roll back if the write doesn't stick.
+    const prevInline = el.style.getPropertyValue(prop);
     // optimistic DOM update so the preview reflects immediately
     if (value === '') el.style.removeProperty(prop);
     else el.style.setProperty(prop, value);
@@ -1301,13 +1303,25 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         setStatus('✓ Saved style.' + prop);
         state.undoStack.push(data.entry);
         state.redoStack = [];
-      } else if (data.ok) {
-        setStatus('No change needed.');
-      } else {
-        setStatus('⚠ ' + (data.error ?? 'could not edit style'));
+        return true;
       }
+      // Write failed or was a no-op → the source did NOT change. Revert the
+      // optimistic DOM edit so the preview matches what's actually on disk
+      // and the user isn't misled into thinking it saved.
+      if (prevInline) el.style.setProperty(prop, prevInline);
+      else el.style.removeProperty(prop);
+      if (data.ok) {
+        setStatus('No change written (source unchanged).');
+      } else {
+        const dyn = /dynamic expression/.test(data.error || '');
+        setStatus('⚠ ' + (data.error ?? 'could not edit style') + (dyn ? ' — use a Claude task to rewrite it.' : ''));
+      }
+      return false;
     } catch (err) {
+      if (prevInline) el.style.setProperty(prop, prevInline);
+      else el.style.removeProperty(prop);
       setStatus('Network error: ' + err.message);
+      return false;
     }
   }
 
