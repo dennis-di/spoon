@@ -900,69 +900,157 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return wrap;
   }
 
+  // Which CSS property does each color mode read/affect?
+  const COLOR_MODE_CSS = { bg: 'backgroundColor', text: 'color', border: 'borderColor', ring: 'outlineColor' };
+
   function colorSection(el) {
     const meta = GROUP_META.color;
     const wrap = section(meta.label, meta.color);
+
+    let activeMode = state._colorMode || 'bg';
+
+    // ── Mode picker: BG / TEXT / BORDER / RING ──
+    const modeWrap = document.createElement('div');
+    Object.assign(modeWrap.style, { display: 'flex', gap: '4px', alignItems: 'center' });
+    const modeLbl = document.createElement('span');
+    modeLbl.textContent = 'Edit';
+    Object.assign(modeLbl.style, { fontSize: '10px', color: '#585b70', width: '40px', textTransform: 'uppercase', letterSpacing: '.06em' });
+    modeWrap.appendChild(modeLbl);
+    const modes = ['bg', 'text', 'border', 'ring'];
+    const modeBtns = [];
+    const grp = document.createElement('div');
+    Object.assign(grp.style, { display: 'flex', gap: '2px', background: '#11111b', borderRadius: '4px', padding: '2px' });
+    for (const m of modes) {
+      const b = document.createElement('button');
+      b.textContent = m.toUpperCase();
+      Object.assign(b.style, {
+        background: 'transparent', color: '#a6adc8', border: 'none',
+        borderRadius: '3px', padding: '3px 8px', cursor: 'pointer',
+        fontFamily: 'inherit', fontSize: '10px', fontWeight: '600',
+      });
+      b.onclick = () => { activeMode = m; state._colorMode = m; rerender(); };
+      modeBtns.push(b);
+      grp.appendChild(b);
+    }
+    modeWrap.appendChild(grp);
+    wrap.appendChild(modeWrap);
+
+    // ── Current-color readout: swatch + value + source ──
+    const readout = document.createElement('div');
+    Object.assign(readout.style, {
+      display: 'flex', alignItems: 'center', gap: '8px',
+      padding: '6px 8px', background: '#181825', borderRadius: '6px',
+      border: '1px solid #313244',
+    });
+    wrap.appendChild(readout);
+
+    // ── Native color picker for arbitrary values ──
+    const pickerRow = document.createElement('div');
+    Object.assign(pickerRow.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+    wrap.appendChild(pickerRow);
+
+    // ── Theme token swatches ──
+    const tokWrap = document.createElement('div');
+    wrap.appendChild(tokWrap);
+
+    // ── Raw color-class chips ──
     const chipRow = document.createElement('div');
     Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-    const refresh = () => {
+    wrap.appendChild(chipRow);
+
+    const rerender = () => {
+      // highlight active mode
+      modeBtns.forEach((b, i) => {
+        const on = modes[i] === activeMode;
+        b.style.background = on ? '#6366f1' : 'transparent';
+        b.style.color = on ? '#fff' : '#a6adc8';
+      });
+
+      const cssProp = COLOR_MODE_CSS[activeMode];
+      const computed = getComputedStyle(el)[cssProp];
+      // Detect the source of the current color
+      const colorRe = activeMode === 'text' ? TEXT_COLOR_RE : new RegExp('^' + activeMode + '-');
+      const activeClass = classList(el).find((c) => colorRe.test(c));
+      const inlineStyleProp = { bg: 'background', text: 'color', border: 'borderColor', ring: 'outlineColor' };
+      const inlineVal = el.style[inlineStyleProp[activeMode]] || (activeMode === 'bg' && el.style.backgroundColor);
+      let source = activeClass ? 'class: ' + activeClass : inlineVal ? 'inline style' : 'inherited / CSS';
+
+      // readout
+      readout.innerHTML = '';
+      const sw = document.createElement('div');
+      Object.assign(sw.style, { width: '28px', height: '28px', borderRadius: '5px', border: '1px solid #45475a', background: computed, flexShrink: '0' });
+      readout.appendChild(sw);
+      const info = document.createElement('div');
+      Object.assign(info.style, { display: 'flex', flexDirection: 'column', gap: '1px', overflow: 'hidden' });
+      info.innerHTML =
+        '<span style="color:#cdd6f4;font-size:11px">' + esc(computed) + '</span>' +
+        '<span style="color:#6c7086;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(source) + '</span>';
+      readout.appendChild(info);
+
+      // Warn when an inline style will win over any class we set
+      if (inlineVal && !activeClass) {
+        const warn = document.createElement('div');
+        warn.textContent = '⚠ inline';
+        warn.title = 'This element sets ' + activeMode + ' via an inline style attribute, which overrides Tailwind classes. Edit the style prop in source, or remove it first.';
+        Object.assign(warn.style, { marginLeft: 'auto', color: '#f9e2af', fontSize: '10px', cursor: 'help' });
+        readout.appendChild(warn);
+      }
+
+      // picker
+      pickerRow.innerHTML = '';
+      const picker = document.createElement('input');
+      picker.type = 'color';
+      picker.value = rgbToHex(computed);
+      Object.assign(picker.style, { width: '36px', height: '28px', border: '1px solid #45475a', borderRadius: '5px', background: '#181825', cursor: 'pointer', padding: '2px' });
+      picker.addEventListener('change', () => {
+        replacePrefixed(el, colorRe, activeMode + '-[' + picker.value + ']');
+        commit(el);
+        setTimeout(rerender, 120);
+      });
+      pickerRow.appendChild(picker);
+      const pickerLbl = document.createElement('span');
+      pickerLbl.textContent = 'Custom ' + activeMode + ' color';
+      Object.assign(pickerLbl.style, { fontSize: '11px', color: '#a6adc8' });
+      pickerRow.appendChild(pickerLbl);
+      if (activeClass) {
+        const clr = document.createElement('button');
+        clr.textContent = 'clear';
+        Object.assign(clr.style, { marginLeft: 'auto', background: '#313244', color: '#cdd6f4', border: 'none', borderRadius: '4px', padding: '3px 8px', cursor: 'pointer', fontSize: '10px', fontFamily: 'inherit' });
+        clr.onclick = () => { replacePrefixed(el, colorRe, ''); commit(el); setTimeout(rerender, 120); };
+        pickerRow.appendChild(clr);
+      }
+
+      // theme tokens
+      tokWrap.innerHTML = '';
+      if (state.tokens.colors && state.tokens.colors.length > 0) {
+        const lbl = document.createElement('div');
+        lbl.textContent = 'Theme tokens';
+        Object.assign(lbl.style, { fontSize: '10px', color: '#585b70', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '.06em' });
+        tokWrap.appendChild(lbl);
+        const swatches = document.createElement('div');
+        Object.assign(swatches.style, { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(28px, 1fr))', gap: '4px' });
+        for (const tk of state.tokens.colors) {
+          const tokenClass = activeMode + '-' + tk.name;
+          const isActive = activeClass === tokenClass;
+          swatches.appendChild(colorSwatch(tk, isActive, () => {
+            replacePrefixed(el, colorRe, tokenClass);
+            commit(el);
+            setTimeout(rerender, 120);
+          }));
+        }
+        tokWrap.appendChild(swatches);
+      }
+
+      // raw chips
       chipRow.innerHTML = '';
       const groups = parseClasses(el.className);
       for (const cls of groups.color) {
-        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); refresh(); }));
+        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); rerender(); }));
       }
-      chipRow.appendChild(addInput(el, 'color', refresh));
+      chipRow.appendChild(addInput(el, 'color', rerender));
     };
-    refresh();
-    wrap.appendChild(chipRow);
 
-    if (state.tokens.colors && state.tokens.colors.length > 0) {
-      // Mode picker: which prefix gets the token? bg- / text- / border-
-      const modeWrap = document.createElement('div');
-      Object.assign(modeWrap.style, { display: 'flex', gap: '4px', alignItems: 'center', marginTop: '8px' });
-      const modeLbl = document.createElement('span');
-      modeLbl.textContent = 'Apply to';
-      Object.assign(modeLbl.style, { fontSize: '10px', color: '#585b70', width: '60px', textTransform: 'uppercase', letterSpacing: '.06em' });
-      modeWrap.appendChild(modeLbl);
-      const modes = ['bg', 'text', 'border', 'ring'];
-      const btns = [];
-      const updateModeBtns = (active) => {
-        btns.forEach((b, i) => {
-          const isActive = modes[i] === active;
-          b.style.background = isActive ? '#6366f1' : 'transparent';
-          b.style.color = isActive ? '#fff' : '#a6adc8';
-        });
-      };
-      const grp = document.createElement('div');
-      Object.assign(grp.style, { display: 'flex', gap: '2px', background: '#11111b', borderRadius: '4px', padding: '2px' });
-      let activeMode = state._colorMode || 'bg';
-      for (const m of modes) {
-        const b = document.createElement('button');
-        b.textContent = m.toUpperCase();
-        Object.assign(b.style, {
-          background: 'transparent', color: '#a6adc8', border: 'none',
-          borderRadius: '3px', padding: '3px 7px', cursor: 'pointer',
-          fontFamily: 'inherit', fontSize: '10px', fontWeight: '600',
-        });
-        b.onclick = () => { activeMode = m; state._colorMode = m; updateModeBtns(m); };
-        btns.push(b);
-        grp.appendChild(b);
-      }
-      updateModeBtns(activeMode);
-      modeWrap.appendChild(grp);
-      wrap.appendChild(modeWrap);
-
-      const lbl = document.createElement('div');
-      lbl.textContent = 'Theme tokens — click to apply';
-      Object.assign(lbl.style, { fontSize: '10px', color: '#585b70', marginTop: '6px', textTransform: 'uppercase', letterSpacing: '.06em' });
-      wrap.appendChild(lbl);
-      const swatches = document.createElement('div');
-      Object.assign(swatches.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-      for (const tk of state.tokens.colors) {
-        swatches.appendChild(colorSwatch(tk, el, () => activeMode, refresh));
-      }
-      wrap.appendChild(swatches);
-    }
+    rerender();
     return wrap;
   }
 
@@ -1289,24 +1377,30 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return wrap;
   }
 
-  function colorSwatch(token, el, getMode, refresh) {
+  function colorSwatch(token, isActive, onClick) {
     const btn = document.createElement('button');
     Object.assign(btn.style, {
-      width: '26px', height: '26px', borderRadius: '5px',
-      border: '1px solid #45475a', cursor: 'pointer', padding: '0',
-      background: token.preview,
+      width: '100%', aspectRatio: '1', borderRadius: '5px',
+      border: isActive ? '2px solid #6366f1' : '1px solid #45475a',
+      cursor: 'pointer', padding: '0', background: token.preview,
+      boxShadow: isActive ? '0 0 0 2px rgba(99,102,241,0.3)' : 'none',
     });
-    btn.title = \`\${token.name} → \${token.preview} (click to apply with current prefix)\`;
-    btn.onclick = () => {
-      const mode = typeof getMode === 'function' ? getMode() : 'bg';
-      // For text-, only replace text COLOR classes — not text-sm / text-center /
-      // text-left etc. which share the prefix but control size/alignment.
-      const re = mode === 'text' ? TEXT_COLOR_RE : new RegExp('^' + mode + '-');
-      replacePrefixed(el, re, mode + '-' + token.name);
-      commit(el);
-      refresh();
-    };
+    btn.title = \`\${token.name} → \${token.preview}\`;
+    btn.onclick = onClick;
     return btn;
+  }
+
+  // Normalise any computed color (rgb/rgba) to #rrggbb for <input type=color>.
+  function rgbToHex(color) {
+    if (!color) return '#000000';
+    if (color[0] === '#') return color.length === 4
+      ? '#' + color.slice(1).split('').map((c) => c + c).join('')
+      : color.slice(0, 7);
+    const m = color.match(/rgba?\\(([^)]+)\\)/);
+    if (!m) return '#000000';
+    const [r, g, b] = m[1].split(',').map((x) => parseInt(x.trim(), 10));
+    const hex = (n) => Math.max(0, Math.min(255, n || 0)).toString(16).padStart(2, '0');
+    return '#' + hex(r) + hex(g) + hex(b);
   }
 
   function inputStyle() {
