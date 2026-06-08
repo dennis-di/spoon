@@ -448,9 +448,9 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       el.removeEventListener('keydown', onKey);
       const liveNode = getTextNode(el);
       const next = liveNode?.textContent ?? '';
-      if (save && next !== orig && state.currentEl === el) {
+      if (save && next !== orig) {
         state.panel.dataset.origText = orig;
-        applyEdits(el);
+        writeText(el, next);
       } else if (!save && liveNode) {
         liveNode.textContent = orig;
       }
@@ -669,10 +669,16 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     input.addEventListener('input', () => {
       const live = getTextNode(el);
       if (live) live.textContent = input.value;
-      commitDebounced(el);
+      writeTextDebounced(el, input.value);
     });
     wrap.appendChild(input);
     return wrap;
+  }
+
+  let textDebounceTimer = null;
+  function writeTextDebounced(el, text, ms = 500) {
+    clearTimeout(textDebounceTimer);
+    textDebounceTimer = setTimeout(() => writeText(el, text), ms);
   }
 
   // ── Layout section: Display + Alignment (Phase 3.2 — placeholder UI) ──
@@ -1182,7 +1188,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       input.value = getTextNode(el)?.textContent ?? '';
       input.dataset.role = 'text-input';
       Object.assign(input.style, inputStyle());
-      input.addEventListener('input', () => { const n = getTextNode(el); if (n) n.textContent = input.value; commitDebounced(el); });
+      input.addEventListener('input', () => { const n = getTextNode(el); if (n) n.textContent = input.value; writeTextDebounced(el, input.value); });
       txt.appendChild(input);
       body.appendChild(txt);
     }
@@ -1297,6 +1303,32 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         setStatus('No change needed.');
       } else {
         setStatus('⚠ ' + (data.error ?? 'could not edit style'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
+  // Dedicated text-only write. Kept separate from className edits because for
+  // components the DOM className is the *merged* class list (e.g. SheetTitle
+  // renders "text-lg font-semibold text-foreground"), which must never be
+  // written back over the source's "text-lg". Text has no such ambiguity.
+  async function writeText(el, text) {
+    const { file, loc } = parseLoc(el.dataset.spoonLoc);
+    const origText = state.panel.dataset.origText;
+    if (origText !== undefined && text === origText) { setStatus('Nothing changed.'); return; }
+    setStatus('Saving…');
+    try {
+      const data = await writeOp(file, loc, { text });
+      if (data.ok && data.entry) {
+        setStatus('✓ Saved text → ' + file.split('/').slice(-1));
+        state.undoStack.push(data.entry);
+        state.redoStack = [];
+        state.panel.dataset.origText = text;
+      } else if (data.ok) {
+        setStatus('No change needed.');
+      } else {
+        setStatus('⚠ ' + (data.error ?? 'could not edit text'));
       }
     } catch (err) {
       setStatus('Network error: ' + err.message);
