@@ -42,11 +42,27 @@ export function transformWithLocation(
   traverse(ast, {
     JSXOpeningElement(nodePath) {
       const nameNode = nodePath.node.name
-      // Only inject on intrinsic (lowercase) elements — HTML tags, not components
-      if (!t.isJSXIdentifier(nameNode)) return
-      if (nameNode.name[0] !== nameNode.name[0].toLowerCase()) return
+
+      // We tag both intrinsic HTML elements AND React components. data-* attrs
+      // are valid HTML and never trigger React warnings; well-behaved
+      // components (e.g. shadcn) spread {...props} so the attribute reaches the
+      // DOM. Components that DON'T forward props simply won't carry the marker
+      // at runtime — harmless, they just aren't selectable.
+      // Skip Fragments (<> / <React.Fragment>) — they render no DOM node.
+      if (t.isJSXIdentifier(nameNode) && nameNode.name === 'Fragment') return
+      if (
+        t.isJSXMemberExpression(nameNode) &&
+        t.isJSXIdentifier(nameNode.property) &&
+        nameNode.property.name === 'Fragment'
+      ) {
+        return
+      }
 
       if (!nodePath.node.loc || nodePath.node.start == null) return
+      // Need the end of the tag name to know where to splice the attribute.
+      // nameNode.end works for JSXIdentifier (div, SheetTitle) and
+      // JSXMemberExpression (Sheet.Title) alike.
+      if (nameNode.end == null) return
 
       // Don't double-inject
       const alreadyHas = nodePath.node.attributes.some(
@@ -57,13 +73,8 @@ export function transformWithLocation(
       const { line, column } = nodePath.node.loc.start
       const locValue = `${relPath}:${line}:${column}`
 
-      // Find the insertion point: right after the tag name in the source.
-      // e.g. `<div` → insert after the `v` character.
-      // nodePath.node.start points to `<`, name length gives us the tag end.
-      const insertAt = nodePath.node.start + 1 + nameNode.name.length
-
       injections.push({
-        offset: insertAt,
+        offset: nameNode.end,
         value: ` data-spoon-loc="${locValue}"`,
       })
     },
