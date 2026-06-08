@@ -5,6 +5,7 @@ import { cwd } from 'node:process'
 import type { ResolvedSpoonOptions } from './options.js'
 import { overlayScript } from './overlay/script.js'
 import { detectTailwind } from './tailwind.js'
+import { applyEditAtLocation, type EditOp } from './writeback.js'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
 
@@ -55,32 +56,41 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
         return badRequest(res, 'invalid JSON')
       }
 
-      const { file, patches, label } = payload
-      if (!file || !Array.isArray(patches)) return badRequest(res, 'invalid payload')
+      const { file, loc, op, label } = payload
+      if (!file || !loc || !op) return badRequest(res, 'invalid payload')
 
       const ext = extname(file)
-      const allowed = ['.tsx', '.ts', '.jsx', '.js', '.css']
+      const allowed = ['.tsx', '.ts', '.jsx', '.js']
       if (!allowed.includes(ext)) return badRequest(res, 'file type not allowed')
 
       try {
         const abs = resolve(cwd(), file)
         const before = await readFile(abs, 'utf8')
-        const after = applyPatches(before, patches)
+        const result = applyEditAtLocation(before, loc.line, loc.column, op)
+        if (!result.ok) {
+          json(res, { error: result.error ?? 'edit failed' }, 422)
+          return
+        }
+        const after = result.code ?? before
         if (after === before) {
           json(res, { ok: true, noop: true })
           return
         }
         await writeFile(abs, after, 'utf8')
 
-        // Record the change so it can be undone or audited
+        // Build the inverse op so this change can be undone/restored.
+        const inverse: EditOp = {}
+        if (op.className !== undefined) inverse.className = result.prevClassName ?? ''
+        if (op.text !== undefined) inverse.text = result.prevText ?? ''
+
         const entry: HistoryEntry = {
           id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
           ts: Date.now(),
           file,
-          label: label ?? summariseLabel(patches),
-          patches,
-          // Inverse patches let us replay the file back to its pre-edit state
-          inverse: patches.map(invertPatch).reverse(),
+          loc,
+          op,
+          inverse,
+          label: label ?? summariseLabel(op),
         }
         await appendHistory(entry)
         json(res, { ok: true, entry })
@@ -117,8 +127,6 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
           ts: Date.now(),
           file: entry.file ?? '',
           label: entry.label ?? 'marker',
-          patches: [],
-          inverse: [],
           marker: true,
         }
         await appendHistory(full)
@@ -136,20 +144,17 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-interface Patch {
-  type: 'class-replace' | 'class-add' | 'class-remove' | 'text' | 'style-prop'
-  /** 1-based line number in the source file */
+interface SourceLoc {
+  /** 1-based line as reported by Babel */
   line: number
-  column?: number
-  /** For class patches: the old class string to find */
-  oldValue?: string
-  /** Replacement / new value */
-  newValue: string
+  /** 0-based column as reported by Babel */
+  column: number
 }
 
 interface WritePayload {
   file: string
-  patches: Patch[]
+  loc: SourceLoc
+  op: EditOp
   /** Optional human label for the history entry, e.g. "Add bg-primary" */
   label?: string
 }
@@ -158,71 +163,20 @@ interface HistoryEntry {
   id: string
   ts: number
   file: string
+  loc?: SourceLoc
+  op?: EditOp
+  /** The op that restores the pre-write state */
+  inverse?: EditOp
   label: string
-  patches: Patch[]
-  /** Patches that, when applied to the post-write file, restore the pre-write state */
-  inverse: Patch[]
   /** True for entries that record a non-write event (checkpoints, comments) */
   marker?: boolean
 }
 
-// ── Patch logic ─────────────────────────────────────────────────────────
-
-function applyPatches(src: string, patches: Patch[]): string {
-  const lines = src.split('\n')
-
-  for (const patch of patches) {
-    const idx = patch.line - 1
-    if (idx < 0 || idx >= lines.length) continue
-    const line = lines[idx]
-
-    if (patch.type === 'class-replace' && patch.oldValue !== undefined) {
-      lines[idx] = line.replace(patch.oldValue, patch.newValue)
-    } else if (patch.type === 'class-add') {
-      lines[idx] = line.replace(
-        /(className=["'`])([^"'`]*)(["'`])/,
-        (_, open, existing, close) => `${open}${existing} ${patch.newValue}`.trimStart() + close,
-      )
-    } else if (patch.type === 'class-remove' && patch.oldValue !== undefined) {
-      lines[idx] = line.replace(
-        new RegExp(`\\b${escapeRe(patch.oldValue)}\\b\\s?`, 'g'),
-        '',
-      )
-    } else if (patch.type === 'text') {
-      lines[idx] = line.replace(patch.oldValue ?? />[^<]*</, `>${patch.newValue}<`)
-    } else if (patch.type === 'style-prop' && patch.oldValue !== undefined) {
-      lines[idx] = line.replace(patch.oldValue, patch.newValue)
-    }
-  }
-
-  return lines.join('\n')
-}
-
-/** Compute the patch that undoes a given patch. */
-function invertPatch(p: Patch): Patch {
-  switch (p.type) {
-    case 'class-replace':
-    case 'style-prop':
-    case 'text':
-      return { ...p, oldValue: p.newValue, newValue: p.oldValue ?? '' }
-    case 'class-add':
-      return { type: 'class-remove', line: p.line, oldValue: p.newValue, newValue: '' }
-    case 'class-remove':
-      return { type: 'class-add', line: p.line, newValue: p.oldValue ?? '' }
-    default:
-      return p
-  }
-}
-
-function summariseLabel(patches: Patch[]): string {
-  if (patches.length === 0) return 'no-op'
-  const p = patches[0]
-  if (p.type === 'class-replace') return 'Replace classes'
-  if (p.type === 'class-add') return `+ ${p.newValue}`
-  if (p.type === 'class-remove') return `- ${p.oldValue ?? ''}`
-  if (p.type === 'text') return 'Edit text'
-  if (p.type === 'style-prop') return 'Edit style'
-  return p.type
+function summariseLabel(op: EditOp): string {
+  if (op.className !== undefined && op.text !== undefined) return 'Edit class + text'
+  if (op.className !== undefined) return 'Edit classes'
+  if (op.text !== undefined) return 'Edit text'
+  return 'edit'
 }
 
 // ── History persistence ─────────────────────────────────────────────────
@@ -259,10 +213,6 @@ async function readBody(req: IncomingMessage): Promise<string> {
   let body = ''
   for await (const chunk of req) body += chunk
   return body
-}
-
-function escapeRe(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function json(res: ServerResponse, data: unknown, status = 200) {

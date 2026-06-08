@@ -369,8 +369,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     if (state.panel?.contains(e.target)) return;
     const el = e.target.closest('[data-spoon-loc]');
     if (!el) return;
-    // Only allow inline edit if element holds a single text node
-    if (!(el.childNodes.length === 1 && el.firstChild.nodeType === 3)) return;
+    // Editable if there's any direct text node (covers <button><Icon/>Label</button>)
+    if (!getTextNode(el)) return;
     e.preventDefault();
     e.stopPropagation();
     selectElement(el);
@@ -378,28 +378,35 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
 
   function inlineEditText(el) {
-    const orig = el.firstChild.textContent;
+    const textNode = getTextNode(el);
+    if (!textNode) return;
+    const orig = textNode.textContent;
+
+    // contenteditable on the whole element keeps icons/children intact;
+    // we read back only the text node afterwards.
     el.setAttribute('contenteditable', 'true');
     el._spoonOldOutline = el.style.outline;
     el.style.outline = '2px dashed #f9e2af';
     el.focus();
-    document.getSelection()?.selectAllChildren(el);
+    // Select just the text node so the user types over the label, not the icon
+    const range = document.createRange();
+    range.selectNodeContents(textNode);
+    const sel = document.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
 
     const finish = (save) => {
       el.removeAttribute('contenteditable');
       el.style.outline = el._spoonOldOutline || '';
       el.removeEventListener('blur', onBlur);
       el.removeEventListener('keydown', onKey);
-      const next = el.firstChild?.textContent ?? '';
-      if (save && next !== orig) {
-        // restore text temporarily so applyEdits sees the diff between orig and current
-        // (panel.dataset.origText holds the baseline)
-        if (state.currentEl === el) {
-          state.panel.dataset.origText = orig;
-          applyEdits(el);
-        }
-      } else if (!save) {
-        el.firstChild.textContent = orig;
+      const liveNode = getTextNode(el);
+      const next = liveNode?.textContent ?? '';
+      if (save && next !== orig && state.currentEl === el) {
+        state.panel.dataset.origText = orig;
+        applyEdits(el);
+      } else if (!save && liveNode) {
+        liveNode.textContent = orig;
       }
     };
     const onBlur = () => finish(true);
@@ -419,9 +426,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     // diffs correctly.
     state.currentEl = el;
     state.panel.dataset.origClass = el.className || '';
-    const initialText = el.childNodes.length === 1 && el.firstChild.nodeType === 3
-      ? el.firstChild.textContent : null;
-    if (initialText !== null) state.panel.dataset.origText = initialText;
+    const tn = getTextNode(el);
+    if (tn) state.panel.dataset.origText = tn.textContent;
     else delete state.panel.dataset.origText;
 
     renderBreadcrumb(el);
@@ -522,6 +528,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   function classifyToken(cls) {
     const bareIdx = cls.lastIndexOf(':');
     const bare = bareIdx >= 0 ? cls.slice(bareIdx + 1) : cls;
+    // Disambiguate text-: size/alignment → typography, otherwise → color
+    if (bare.startsWith('text-')) {
+      return TEXT_NON_COLOR.test(bare) || /^text-(opacity|wrap|nowrap)/.test(bare) ? 'typography' : 'color';
+    }
     for (const [id, re] of GROUPS) if (re.test(bare)) return id;
     return 'other';
   }
@@ -533,6 +543,20 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
 
   // ── Class manipulation helpers ────────────────────────────────────────
+
+  // text- size/alignment/leading tokens that are NOT colors
+  const TEXT_NON_COLOR = /^text-(xs|sm|base|lg|xl|\\dxl|left|center|right|justify|start|end|wrap|nowrap|balance|pretty|ellipsis|clip)$/;
+  // A text- class is a color if it's text- but not one of the above
+  const TEXT_COLOR_RE = /^text-(?!xs$|sm$|base$|lg$|xl$|\\dxl$|left$|center$|right$|justify$|start$|end$|wrap$|nowrap$|balance$|pretty$|ellipsis$|clip$)/;
+
+  // Returns the first non-empty direct text node, or null. Works for
+  // <button><Icon/>Label</button> where the text isn't the only child.
+  function getTextNode(el) {
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3 && n.textContent.trim() !== '') return n;
+    }
+    return null;
+  }
 
   function classList(el) { return (el.className || '').split(/\\s+/).filter(Boolean); }
   function setClassList(el, arr) { el.className = arr.join(' '); }
@@ -566,8 +590,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   };
 
   function renderPropertiesTab(body, el) {
-    // Text editor at top, if element has a single text child
-    if (el.childNodes.length === 1 && el.firstChild.nodeType === 3) {
+    // Text editor at top, if element has any editable direct text node
+    if (getTextNode(el)) {
       body.appendChild(textSection(el));
     }
     // Visual editors (Phase 3.1–3.3) — placeholders to be filled by next commit
@@ -592,11 +616,13 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     wrap.appendChild(hint);
     const input = document.createElement('input');
     input.type = 'text';
-    input.value = el.firstChild?.textContent ?? '';
+    const tn = getTextNode(el);
+    input.value = tn?.textContent ?? '';
     Object.assign(input.style, inputStyle());
     input.dataset.role = 'text-input';
     input.addEventListener('input', () => {
-      if (el.firstChild) el.firstChild.textContent = input.value;
+      const live = getTextNode(el);
+      if (live) live.textContent = input.value;
       commitDebounced(el);
     });
     wrap.appendChild(input);
@@ -607,6 +633,12 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   function layoutSection(el) {
     const wrap = section('Layout', GROUP_META.layout.color);
+
+    // Show the *effective* display: explicit class wins, else computed style.
+    const computedDisplay = getComputedStyle(el).display;
+    const displayClassMap = { block: 'block', flex: 'flex', 'inline-flex': 'inline-flex', grid: 'grid', 'inline-block': 'inline-block', none: 'hidden' };
+    const explicitDisplay = classList(el).find((c) => /^(block|inline-block|inline|flex|inline-flex|grid|inline-grid|hidden|table|contents|flow-root)$/.test(c));
+    const effectiveDisplay = explicitDisplay || displayClassMap[computedDisplay] || computedDisplay;
 
     const displayRow = buttonRow('Display', [
       ['block',        'Block'],
@@ -619,11 +651,19 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       replacePrefixed(el, /^(block|inline-block|inline|flex|inline-flex|grid|inline-grid|hidden|table|contents|flow-root)$/, val);
       commit(el);
       renderTab();
-    }, (val) => classList(el).includes(val));
+    }, (val) => val === effectiveDisplay);
     wrap.appendChild(displayRow);
+    // Hint when the active display is inherited rather than set by a class
+    if (!explicitDisplay) {
+      const hint = document.createElement('div');
+      hint.textContent = 'current: ' + computedDisplay + ' (from CSS, not a class)';
+      Object.assign(hint.style, { fontSize: '10px', color: '#585b70', fontStyle: 'italic' });
+      wrap.appendChild(hint);
+    }
 
     const cur = classList(el);
-    if (cur.includes('flex') || cur.includes('inline-flex')) {
+    const isFlex = cur.includes('flex') || cur.includes('inline-flex') || computedDisplay === 'flex';
+    if (isFlex) {
       wrap.appendChild(buttonRow('Items', [
         ['items-start',    '⊤'],
         ['items-center',   '⊕'],
@@ -663,15 +703,21 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   function sizeRow(el, dim, label) {
     const row = document.createElement('div');
-    Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+    Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' });
 
     const lbl = document.createElement('span');
     lbl.textContent = label;
     Object.assign(lbl.style, { fontSize: '11px', color: '#a6adc8', width: '50px' });
     row.appendChild(lbl);
 
+    // Parse the existing class (w-full / w-1/2 / w-[124px] / w-64 / none)
     const cur = findPrefixed(el, new RegExp('^' + dim + '-'));
-    const mode = !cur ? 'auto' : /-(full|screen)$/.test(cur) ? 'fill' : /\\[/.test(cur) ? 'fixed' : 'preset';
+    let mode = 'auto';
+    if (cur) {
+      if (/-(full|screen|min|max|fit)$/.test(cur)) mode = 'fill';
+      else if (/\\[.+\\]/.test(cur)) mode = 'fixed';
+      else if (cur !== dim + '-auto') mode = 'preset';
+    }
 
     const modeSel = document.createElement('select');
     Object.assign(modeSel.style, selectStyle());
@@ -685,59 +731,150 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
     const valueInput = document.createElement('input');
     valueInput.type = 'text';
-    valueInput.placeholder = mode === 'fixed' ? '124px' : '4';
+    // Pre-fill from the current class so the user sees the real value
     if (mode === 'fixed' && cur) valueInput.value = cur.match(/\\[(.+)\\]/)?.[1] ?? '';
     else if (mode === 'preset' && cur) valueInput.value = cur.replace(dim + '-', '');
-    Object.assign(valueInput.style, { ...inputStyle(), flex: '1' });
-    row.appendChild(valueInput);
+    else if (mode === 'fill' && cur) valueInput.value = cur.replace(dim + '-', '');
+    Object.assign(valueInput.style, { ...inputStyle(), flex: '1', minWidth: '70px' });
+
+    // Live computed pixel value so the user always knows the actual size + unit
+    const computed = document.createElement('span');
+    const px = getComputedStyle(el)[dim === 'w' ? 'width' : 'height'];
+    computed.textContent = '= ' + px;
+    Object.assign(computed.style, { fontSize: '10px', color: '#6c7086', width: '100%', paddingLeft: '56px' });
+
+    const syncPlaceholder = () => {
+      const m = modeSel.value;
+      valueInput.placeholder =
+        m === 'fixed' ? 'e.g. 124px, 20rem, 50%' :
+        m === 'preset' ? 'e.g. 64, 1/2, full' :
+        m === 'fill' ? 'full / screen / fit' : '—';
+      valueInput.style.display = m === 'auto' ? 'none' : '';
+    };
+    syncPlaceholder();
 
     const update = () => {
       const m = modeSel.value;
       const re = new RegExp('^' + dim + '-');
       let changed = true;
       if (m === 'auto') { replacePrefixed(el, re, dim + '-auto'); }
-      else if (m === 'fill') { replacePrefixed(el, re, dim + '-full'); }
+      else if (m === 'fill') { replacePrefixed(el, re, dim + '-' + (valueInput.value.trim() || 'full')); }
       else if (m === 'preset') {
         const v = valueInput.value.trim();
-        if (v) replacePrefixed(el, re, dim + '-' + v);
-        else changed = false;
+        if (v) replacePrefixed(el, re, dim + '-' + v); else changed = false;
       } else if (m === 'fixed') {
         const v = valueInput.value.trim();
-        if (v) replacePrefixed(el, re, dim + '-[' + v + ']');
-        else changed = false;
+        // Tailwind arbitrary value: spaces must be underscores
+        if (v) replacePrefixed(el, re, dim + '-[' + v.replace(/\\s+/g, '_') + ']'); else changed = false;
       }
-      if (changed) commit(el);
+      if (changed) { commit(el); setTimeout(renderTab, 150); }
     };
-    modeSel.addEventListener('change', update);
+    modeSel.addEventListener('change', () => { syncPlaceholder(); if (modeSel.value === 'auto') update(); });
     valueInput.addEventListener('change', update);
     valueInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') update(); });
 
+    row.appendChild(valueInput);
+    row.appendChild(computed);
     return row;
   }
 
   // ── Spacing-Box (Phase 3.1 — placeholder, filled in next commit) ──────
 
-  function spacingSection(el) {
-    const wrap = section('Spacing', GROUP_META.spacing.color);
-    const hint = document.createElement('div');
-    hint.textContent = 'Visual margin/padding editor coming next';
-    Object.assign(hint.style, { fontSize: '10px', color: '#585b70', fontStyle: 'italic' });
-    wrap.appendChild(hint);
+  // Read the current Tailwind value for a spacing side, checking specific
+  // side → axis → all, e.g. for padding-top: pt-* then py-* then p-*.
+  function readSpacing(el, prop, side) {
+    const cls = classList(el);
+    const p = prop; // 'p' or 'm'
+    const axisOf = { t: 'y', b: 'y', l: 'x', r: 'x' };
+    const specific = cls.find((c) => new RegExp('^-?' + p + side + '-').test(c));
+    if (specific) return specific.replace(new RegExp('^(-?' + p + side + '-)'), '');
+    const axis = cls.find((c) => new RegExp('^-?' + p + axisOf[side] + '-').test(c));
+    if (axis) return axis.replace(new RegExp('^(-?' + p + axisOf[side] + '-)'), '');
+    const all = cls.find((c) => new RegExp('^-?' + p + '-').test(c));
+    if (all) return all.replace(new RegExp('^(-?' + p + '-)'), '');
+    return '';
+  }
 
-    const meta = GROUP_META.spacing;
-    const chipRow = document.createElement('div');
-    Object.assign(chipRow.style, { display: 'flex', flexWrap: 'wrap', gap: '4px' });
-    const refresh = () => {
-      chipRow.innerHTML = '';
-      const groups = parseClasses(el.className);
-      for (const cls of groups.spacing) {
-        chipRow.appendChild(chip(cls, meta.color, () => { removeClass(el, cls); commit(el); refresh(); }));
-      }
-      chipRow.appendChild(addInput(el, 'spacing', refresh));
-    };
-    refresh();
-    wrap.appendChild(chipRow);
+  function writeSpacing(el, prop, side, value) {
+    // Remove any class affecting this side (specific, axis, all) then set specific.
+    const axisOf = { t: 'y', b: 'y', l: 'x', r: 'x' };
+    const re = new RegExp('^-?' + prop + '(' + side + '|' + axisOf[side] + '|)-');
+    const next = classList(el).filter((c) => !re.test(c));
+    if (value !== '') next.push(prop + side + '-' + value);
+    setClassList(el, next);
+    commit(el);
+  }
+
+  function spacingSection(el) {
+    const wrap = section('Spacing — margin / padding', GROUP_META.spacing.color);
+
+    // Nested box: outer = margin, inner = padding, like Webflow/Figma.
+    const outer = document.createElement('div');
+    Object.assign(outer.style, {
+      position: 'relative', background: '#181825', border: '1px solid #313244',
+      borderRadius: '6px', padding: '26px', textAlign: 'center',
+    });
+    tag(outer, 'MARGIN', '4px', '6px', '#585b70');
+
+    const inner = document.createElement('div');
+    Object.assign(inner.style, {
+      position: 'relative', background: '#11111b', border: '1px solid #45475a',
+      borderRadius: '4px', padding: '26px',
+    });
+    tag(inner, 'PADDING', '3px', '5px', '#585b70');
+    const center = document.createElement('div');
+    Object.assign(center.style, { height: '14px', background: '#313244', borderRadius: '3px' });
+    inner.appendChild(center);
+
+    // margin inputs on the outer box (4 sides)
+    spacingField(outer, el, 'm', 't', 'top');
+    spacingField(outer, el, 'm', 'b', 'bottom');
+    spacingField(outer, el, 'm', 'l', 'left');
+    spacingField(outer, el, 'm', 'r', 'right');
+    // padding inputs on the inner box
+    spacingField(inner, el, 'p', 't', 'top');
+    spacingField(inner, el, 'p', 'b', 'bottom');
+    spacingField(inner, el, 'p', 'l', 'left');
+    spacingField(inner, el, 'p', 'r', 'right');
+
+    outer.appendChild(inner);
+    wrap.appendChild(outer);
+
+    const hint = document.createElement('div');
+    hint.textContent = 'Tailwind scale (0–16…) or arbitrary like 12px. Empty = none.';
+    Object.assign(hint.style, { fontSize: '10px', color: '#585b70' });
+    wrap.appendChild(hint);
     return wrap;
+  }
+
+  function tag(box, text, top, left, color) {
+    const t = document.createElement('span');
+    t.textContent = text;
+    Object.assign(t.style, { position: 'absolute', top, left, fontSize: '8px', letterSpacing: '.08em', color });
+    box.appendChild(t);
+  }
+
+  function spacingField(box, el, prop, side, sideName) {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = readSpacing(el, prop, side);
+    inp.title = prop === 'm' ? 'margin-' + sideName : 'padding-' + sideName;
+    const pos = {
+      t: { top: '4px', left: '50%', transform: 'translateX(-50%)' },
+      b: { bottom: '4px', left: '50%', transform: 'translateX(-50%)' },
+      l: { left: '4px', top: '50%', transform: 'translateY(-50%)' },
+      r: { right: '4px', top: '50%', transform: 'translateY(-50%)' },
+    }[side];
+    Object.assign(inp.style, {
+      position: 'absolute', width: '30px', textAlign: 'center',
+      background: '#1e1e2e', border: '1px solid #45475a', color: '#cdd6f4',
+      borderRadius: '3px', padding: '2px 0', fontSize: '11px', fontFamily: 'inherit',
+      outline: 'none', ...pos,
+    });
+    const apply = () => writeSpacing(el, prop, side, inp.value.trim());
+    inp.addEventListener('change', apply);
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+    box.appendChild(inp);
   }
 
   function chipSection(el, groupId) {
@@ -840,14 +977,14 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     cls.appendChild(ta);
     body.appendChild(cls);
 
-    if (el.childNodes.length === 1 && el.firstChild.nodeType === 3) {
+    if (getTextNode(el)) {
       const txt = section('Text', '#f9e2af');
       const input = document.createElement('input');
       input.type = 'text';
-      input.value = el.firstChild.textContent ?? '';
+      input.value = getTextNode(el)?.textContent ?? '';
       input.dataset.role = 'text-input';
       Object.assign(input.style, inputStyle());
-      input.addEventListener('input', () => { el.firstChild.textContent = input.value; commitDebounced(el); });
+      input.addEventListener('input', () => { const n = getTextNode(el); if (n) n.textContent = input.value; commitDebounced(el); });
       txt.appendChild(input);
       body.appendChild(txt);
     }
@@ -908,20 +1045,15 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
 
   async function restoreEntry(entry) {
-    if (!entry.inverse || entry.inverse.length === 0) {
+    if (entry.marker || !entry.inverse || !entry.loc) {
       setStatus('Marker entry — nothing to restore.');
       return;
     }
     setStatus('Restoring…');
     try {
-      const res = await fetch(API + '/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: entry.file, patches: entry.inverse, label: 'Restore @ ' + new Date(entry.ts).toLocaleTimeString() }),
-      });
-      const data = await res.json();
-      if (data.ok) setStatus('✓ Restored');
-      else setStatus('Error: ' + (data.error ?? 'unknown'));
+      const data = await writeOp(entry.file, entry.loc, entry.inverse, 'Restore @ ' + new Date(entry.ts).toLocaleTimeString());
+      if (data.ok) setStatus('✓ Restored to before "' + entry.label + '"');
+      else setStatus('⚠ ' + (data.error ?? 'restore failed'));
       renderTab();
     } catch (err) {
       setStatus('Network error: ' + err.message);
@@ -930,88 +1062,77 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   // ── Apply / Revert / Undo / Redo ──────────────────────────────────────
 
+  // Parse "src/App.tsx:42:6" → { file, loc:{line,column} }
+  function parseLoc(spoonLoc) {
+    const parts = spoonLoc.split(':');
+    const column = Number(parts.pop());
+    const line = Number(parts.pop());
+    const file = parts.join(':');
+    return { file, loc: { line, column } };
+  }
+
+  async function writeOp(file, loc, op, label) {
+    const res = await fetch(API + '/write', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file, loc, op, label }),
+    });
+    return res.json();
+  }
+
   async function applyEdits(el) {
-    const loc = el.dataset.spoonLoc;
-    const [file, lineStr] = loc.split(':');
-    const line = Number(lineStr);
+    const { file, loc } = parseLoc(el.dataset.spoonLoc);
     const origClass = state.panel.dataset.origClass ?? '';
     const origText = state.panel.dataset.origText;
 
-    const patches = [];
-    if (el.className !== origClass) {
-      patches.push({ type: 'class-replace', line, oldValue: origClass, newValue: el.className });
-    }
-    const textInput = state.panel.querySelector('[data-role="text-input"]');
-    if (textInput && origText !== undefined && textInput.value !== origText) {
-      patches.push({ type: 'text', line, oldValue: origText, newValue: textInput.value });
-    }
-    // Also catch inline-edited text changes (when no text-input is in the DOM)
-    if (!textInput && origText !== undefined && el.firstChild?.nodeType === 3 && el.firstChild.textContent !== origText) {
-      patches.push({ type: 'text', line, oldValue: origText, newValue: el.firstChild.textContent });
-    }
-    if (patches.length === 0) { setStatus('Nothing changed.'); return; }
+    const op = {};
+    if (el.className !== origClass) op.className = el.className;
 
-    setStatus('Writing…');
+    // Text can come from the panel input or from an inline contenteditable edit
+    const textInput = state.panel.querySelector('[data-role="text-input"]');
+    const tn = getTextNode(el);
+    const domText = tn ? tn.textContent : undefined;
+    const newText = textInput ? textInput.value : domText;
+    if (origText !== undefined && newText !== undefined && newText !== origText) {
+      op.text = newText;
+    }
+
+    if (Object.keys(op).length === 0) { setStatus('Nothing changed.'); return; }
+
+    setStatus('Saving…');
     try {
-      const res = await fetch(API + '/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file, patches }),
-      });
-      const data = await res.json();
+      const data = await writeOp(file, loc, op);
       if (data.ok && data.entry) {
-        setStatus('✓ Saved → ' + file);
-        // Local undo stack mirrors the server entry — undo without round-trip noise
-        state.undoStack.push({ el, file, line, entry: data.entry });
+        setStatus('✓ Saved → ' + file.split('/').slice(-1));
+        state.undoStack.push(data.entry);
         state.redoStack = [];
+        // Rebase baselines to the just-saved state
         state.panel.dataset.origClass = el.className;
-        if (textInput) state.panel.dataset.origText = textInput.value;
-        else if (el.firstChild?.nodeType === 3) state.panel.dataset.origText = el.firstChild.textContent;
+        if (op.text !== undefined) state.panel.dataset.origText = op.text;
       } else if (data.ok) {
-        setStatus('✓ Saved (no-op)');
+        setStatus('No change needed.');
       } else {
-        setStatus('Error: ' + (data.error ?? 'unknown'));
+        // 422 = AST couldn't safely edit (dynamic className etc.)
+        setStatus('⚠ ' + (data.error ?? 'could not edit'));
       }
     } catch (err) {
       setStatus('Network error: ' + err.message);
     }
   }
 
-  function revert() {
-    const el = state.currentEl;
-    if (!el) return;
-    el.className = state.panel.dataset.origClass ?? '';
-    if (state.panel.dataset.origText !== undefined && el.firstChild) {
-      el.firstChild.textContent = state.panel.dataset.origText;
-    }
-    renderTab();
-    setStatus('Reverted unsaved changes.');
-  }
-
   async function undo() {
-    const item = state.undoStack.pop();
-    if (!item) { setStatus('Nothing to undo.'); return; }
+    const entry = state.undoStack.pop();
+    if (!entry) { setStatus('Nothing to undo.'); return; }
     setStatus('Undoing…');
     try {
-      const res = await fetch(API + '/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: item.file, patches: item.entry.inverse, label: 'Undo: ' + item.entry.label }),
-      });
-      const data = await res.json();
+      const data = await writeOp(entry.file, entry.loc, entry.inverse, 'Undo: ' + entry.label);
       if (data.ok) {
-        state.redoStack.push(item);
-        setStatus('↶ Undone');
-        if (state.currentEl) {
-          // Re-sync baseline from DOM so the next apply diffs correctly
-          state.panel.dataset.origClass = state.currentEl.className;
-          if (state.currentEl.firstChild?.nodeType === 3) {
-            state.panel.dataset.origText = state.currentEl.firstChild.textContent;
-          }
-          renderTab();
-        }
+        state.redoStack.push(entry);
+        setStatus('↶ Undone — reloading…');
+        resyncBaseline();
       } else {
-        setStatus('Error: ' + (data.error ?? 'unknown'));
+        setStatus('⚠ ' + (data.error ?? 'undo failed'));
+        state.undoStack.push(entry); // put it back
       }
     } catch (err) {
       setStatus('Network error: ' + err.message);
@@ -1019,32 +1140,33 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   }
 
   async function redo() {
-    const item = state.redoStack.pop();
-    if (!item) { setStatus('Nothing to redo.'); return; }
+    const entry = state.redoStack.pop();
+    if (!entry) { setStatus('Nothing to redo.'); return; }
     setStatus('Redoing…');
     try {
-      const res = await fetch(API + '/write', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: item.file, patches: item.entry.patches, label: 'Redo: ' + item.entry.label }),
-      });
-      const data = await res.json();
+      const data = await writeOp(entry.file, entry.loc, entry.op, 'Redo: ' + entry.label);
       if (data.ok) {
-        state.undoStack.push(item);
-        setStatus('↷ Redone');
-        if (state.currentEl) {
-          state.panel.dataset.origClass = state.currentEl.className;
-          if (state.currentEl.firstChild?.nodeType === 3) {
-            state.panel.dataset.origText = state.currentEl.firstChild.textContent;
-          }
-          renderTab();
-        }
+        state.undoStack.push(entry);
+        setStatus('↷ Redone — reloading…');
+        resyncBaseline();
       } else {
-        setStatus('Error: ' + (data.error ?? 'unknown'));
+        setStatus('⚠ ' + (data.error ?? 'redo failed'));
+        state.redoStack.push(entry);
       }
     } catch (err) {
       setStatus('Network error: ' + err.message);
     }
+  }
+
+  // After undo/redo the file changed on disk; HMR will reload the module.
+  // We can't reliably re-find the same DOM node post-reload, so just refresh
+  // the panel baselines from whatever is currently selected.
+  function resyncBaseline() {
+    if (!state.currentEl) return;
+    state.panel.dataset.origClass = state.currentEl.className;
+    const tn = getTextNode(state.currentEl);
+    if (tn) state.panel.dataset.origText = tn.textContent;
+    renderTab();
   }
 
   function setStatus(msg) {
@@ -1177,7 +1299,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     btn.title = \`\${token.name} → \${token.preview} (click to apply with current prefix)\`;
     btn.onclick = () => {
       const mode = typeof getMode === 'function' ? getMode() : 'bg';
-      replacePrefixed(el, new RegExp('^' + mode + '-'), mode + '-' + token.name);
+      // For text-, only replace text COLOR classes — not text-sm / text-center /
+      // text-left etc. which share the prefix but control size/alignment.
+      const re = mode === 'text' ? TEXT_COLOR_RE : new RegExp('^' + mode + '-');
+      replacePrefixed(el, re, mode + '-' + token.name);
       commit(el);
       refresh();
     };
