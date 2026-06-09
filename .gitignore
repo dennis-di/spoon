@@ -2,3 +2,6 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+
+# spoon local history/checkpoints (when dogfooding spoon on itself)
+.spoon/

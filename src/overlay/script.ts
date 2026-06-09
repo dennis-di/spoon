@@ -35,6 +35,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     undoStack: [],
     redoStack: [],
     historyOpenCount: 0,
+    task: null, // { running, lines, startedAt, instruction, done }
   };
 
   // ── Hotkey parsing — matches on physical e.code so macOS' Alt-letter
@@ -1188,6 +1189,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
   // ── Task tab (Claude agent) ───────────────────────────────────────────
 
+  // Task state is global (not tied to the tab DOM) so a running task keeps
+  // going in the background when you switch tabs/elements, and its full log
+  // is replayed when you return to the Task tab.
+  // state.task = { running, lines:[{text,color}], startedAt, instruction, locLabel, done }
   function renderTaskTab(body, el) {
     const wrap = section('✦ Ask Claude to change this', '#6366f1');
     body.appendChild(wrap);
@@ -1219,18 +1224,19 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     ctrlRow.appendChild(modelSel);
 
     const runBtn = document.createElement('button');
-    runBtn.textContent = '▶ Run';
+    runBtn.id = '__spoon-task-run';
     Object.assign(runBtn.style, { flex: '1', background: '#6366f1', color: '#fff', border: 'none', borderRadius: '5px', padding: '7px', cursor: 'pointer', fontSize: '12px', fontWeight: '600', fontFamily: 'inherit' });
     ctrlRow.appendChild(runBtn);
     wrap.appendChild(ctrlRow);
 
     const hint = document.createElement('div');
-    hint.textContent = 'A git checkpoint is taken before Claude edits, so you can revert from the History tab.';
+    hint.textContent = 'Runs in the background — you can switch tabs. A git checkpoint is taken first (revert from History).';
     Object.assign(hint.style, { fontSize: '10px', color: '#585b70' });
     wrap.appendChild(hint);
 
-    // Output console
+    // Output console — re-created each render; we replay state.task.lines into it.
     const out = document.createElement('pre');
+    out.id = '__spoon-task-out';
     Object.assign(out.style, {
       background: '#11111b', border: '1px solid #313244', borderRadius: '6px',
       padding: '8px', fontSize: '11px', lineHeight: '1.4', color: '#cdd6f4',
@@ -1239,88 +1245,113 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     });
     wrap.appendChild(out);
 
-    runBtn.onclick = () => runClaudeTask(el, ta.value.trim(), modelSel.value, out, runBtn);
+    // Replay any existing task log (so a backgrounded task shows its progress)
+    if (state.task && state.task.lines.length) {
+      out.style.display = 'block';
+      for (const ln of state.task.lines) {
+        const span = document.createElement('span');
+        span.textContent = ln.text;
+        if (ln.color) span.style.color = ln.color;
+        out.appendChild(span);
+      }
+      out.scrollTop = out.scrollHeight;
+    }
+
+    runBtn.onclick = () => {
+      if (state.task && state.task.running) { setStatus('A task is already running.'); return; }
+      runClaudeTask(el, ta.value.trim(), modelSel.value);
+    };
+
+    syncRunBtn();
   }
 
-  function appendOut(out, text, color) {
-    out.style.display = 'block';
-    const span = document.createElement('span');
-    span.textContent = text;
-    if (color) span.style.color = color;
-    out.appendChild(span);
-    out.scrollTop = out.scrollHeight;
+  // Reflect running/idle state on the run button (called from the ticker too).
+  function syncRunBtn() {
+    const btn = state.panel?.querySelector('#__spoon-task-run');
+    if (!btn) return;
+    if (state.task && state.task.running) {
+      const secs = Math.floor((Date.now() - state.task.startedAt) / 1000);
+      btn.textContent = '… running ' + secs + 's';
+      btn.style.opacity = '0.6';
+      btn.disabled = true;
+    } else {
+      btn.textContent = '▶ Run';
+      btn.style.opacity = '1';
+      btn.disabled = false;
+    }
   }
 
-  async function runClaudeTask(el, instruction, model, out, runBtn) {
+  // Append a line to the task log (source of truth) and to the live console if
+  // the Task tab is currently mounted.
+  function taskLog(text, color) {
+    if (!state.task) return;
+    state.task.lines.push({ text, color });
+    const out = state.panel?.querySelector('#__spoon-task-out');
+    if (out) {
+      out.style.display = 'block';
+      const span = document.createElement('span');
+      span.textContent = text;
+      if (color) span.style.color = color;
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+  }
+
+  let taskTicker = null;
+  async function runClaudeTask(el, instruction, model) {
     if (!instruction) { setStatus('Type an instruction first.'); return; }
     const loc = el.dataset.spoonLoc;
     const { file, loc: srcLoc } = parseLoc(loc);
 
-    out.textContent = '';
-    appendOut(out, '✦ Starting Claude (' + model + ')…\\n', '#6366f1');
-    runBtn.disabled = true;
-    runBtn.style.opacity = '0.6';
+    // Fresh task state
+    state.task = { running: true, lines: [], startedAt: Date.now(), instruction, done: false };
+    taskLog('✦ Starting Claude (' + model + ')…\\n', '#6366f1');
 
-    // Live elapsed ticker so the console never looks frozen during the
-    // initial context-load (which can take 10-30s before the first token).
-    const t0 = Date.now();
-    let sawActivity = false;
-    const ticker = setInterval(() => {
-      const secs = Math.floor((Date.now() - t0) / 1000);
-      runBtn.textContent = '… ' + secs + 's';
-      if (!sawActivity && secs >= 3) {
-        // keep the user reassured while Claude reads the project
-        runBtn.title = 'Claude is reading your project (' + secs + 's)…';
-      }
-    }, 1000);
+    // Global ticker keeps the run button live even across tab switches.
+    clearInterval(taskTicker);
+    taskTicker = setInterval(syncRunBtn, 1000);
+    syncRunBtn();
 
     try {
       const res = await fetch(API + '/task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          instruction,
-          file,
-          line: srcLoc.line,
-          loc,
-          html: el.outerHTML.slice(0, 1500),
-          model,
+          instruction, file, line: srcLoc.line, loc,
+          html: el.outerHTML.slice(0, 1500), model,
         }),
       });
 
       if (!res.ok || !res.body) {
-        appendOut(out, '\\nFailed to start task (HTTP ' + res.status + ')', '#f38ba8');
+        taskLog('\\nFailed to start task (HTTP ' + res.status + ')\\n', '#f38ba8');
         return;
       }
 
-      // Parse the SSE stream
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        sawActivity = true;
         buf += decoder.decode(value, { stream: true });
         const frames = buf.split('\\n\\n');
         buf = frames.pop() ?? '';
-        for (const frame of frames) handleSSEFrame(frame, out);
+        for (const frame of frames) handleSSEFrame(frame);
       }
-      const took = Math.floor((Date.now() - t0) / 1000);
-      appendOut(out, '\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
-      setStatus('✓ Claude task done. Check the result; revert via History if needed.');
+      const took = Math.floor((Date.now() - state.task.startedAt) / 1000);
+      taskLog('\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
+      setStatus('✓ Claude task done. Revert via History if needed.');
     } catch (err) {
-      appendOut(out, '\\nError: ' + err.message, '#f38ba8');
+      taskLog('\\nError: ' + err.message + '\\n', '#f38ba8');
     } finally {
-      clearInterval(ticker);
-      runBtn.disabled = false;
-      runBtn.textContent = '▶ Run';
-      runBtn.style.opacity = '1';
-      runBtn.title = '';
+      if (state.task) { state.task.running = false; state.task.done = true; }
+      clearInterval(taskTicker);
+      taskTicker = null;
+      syncRunBtn();
     }
   }
 
-  function handleSSEFrame(frame, out) {
+  function handleSSEFrame(frame) {
     let event = 'message', data = '';
     for (const line of frame.split('\\n')) {
       if (line.startsWith('event:')) event = line.slice(6).trim();
@@ -1330,50 +1361,49 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     let parsed;
     try { parsed = JSON.parse(data); } catch { return; }
 
-    if (event === 'stderr') {
-      // Claude writes some progress to stderr; show dimmed
-      appendOut(out, parsed.text, '#6c7086');
+    if (event === 'start') {
+      taskLog('● process started (pid ' + (parsed.pid || '?') + '), loading context…\\n', '#585b70');
+    } else if (event === 'stderr') {
+      const txt = (parsed.text || '').trim();
+      if (txt) taskLog('  ' + txt + '\\n', '#6c7086');
     } else if (event === 'error') {
-      appendOut(out, '\\n⚠ ' + parsed.message + '\\n', '#f38ba8');
+      taskLog('\\n⚠ ' + parsed.message + '\\n', '#f38ba8');
     } else if (event === 'message') {
-      renderClaudeMessage(parsed, out);
+      renderClaudeMessage(parsed);
     } else if (event === 'raw') {
-      appendOut(out, parsed.text + '\\n', '#6c7086');
+      taskLog(parsed.text + '\\n', '#6c7086');
     }
   }
 
-  // Render a claude stream-json message into the console, surfacing what the
-  // agent is actually doing: init, reasoning text, each tool call with a
-  // human-readable summary, tool results, and the final answer.
-  function renderClaudeMessage(msg, out) {
+  // Render a claude stream-json message, surfacing what the agent is doing.
+  function renderClaudeMessage(msg) {
     if (msg.type === 'system' && msg.subtype === 'init') {
-      appendOut(out, '● connected · ' + (msg.model || 'claude') + ' · reading your project…\\n', '#89b4fa');
+      taskLog('● connected · ' + (msg.model || 'claude') + ' · reading your project…\\n', '#89b4fa');
       return;
     }
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
         if (block.type === 'text' && block.text && block.text.trim()) {
-          appendOut(out, '\\n' + block.text.trim() + '\\n', '#cdd6f4');
+          taskLog('\\n' + block.text.trim() + '\\n', '#cdd6f4');
         } else if (block.type === 'tool_use') {
-          appendOut(out, '\\n  ⚙ ' + describeTool(block) + '\\n', '#fab387');
+          taskLog('\\n  ⚙ ' + describeTool(block) + '\\n', '#fab387');
         }
       }
       return;
     }
     if (msg.type === 'user' && msg.message?.content) {
-      // tool_result blocks — show a short confirmation
       for (const block of msg.message.content) {
         if (block.type === 'tool_result') {
           const ok = !block.is_error;
-          appendOut(out, '    ' + (ok ? '✓ done' : '✗ failed') + '\\n', ok ? '#a6e3a1' : '#f38ba8');
+          taskLog('    ' + (ok ? '✓ done' : '✗ failed') + '\\n', ok ? '#a6e3a1' : '#f38ba8');
         }
       }
       return;
     }
     if (msg.type === 'result') {
-      if (msg.result) appendOut(out, '\\n' + msg.result + '\\n', '#a6e3a1');
+      if (msg.result) taskLog('\\n' + msg.result + '\\n', '#a6e3a1');
       if (msg.total_cost_usd) {
-        appendOut(out, 'cost: $' + msg.total_cost_usd.toFixed(4) + ' · ' + (msg.num_turns || '?') + ' turns\\n', '#585b70');
+        taskLog('cost: $' + msg.total_cost_usd.toFixed(4) + ' · ' + (msg.num_turns || '?') + ' turns\\n', '#585b70');
       }
     }
   }

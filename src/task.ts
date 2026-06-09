@@ -101,9 +101,12 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
   delete childEnv.CLAUDE_CODE_SSE_PORT
   delete childEnv.CLAUDE_CODE_ENTRYPOINT
 
+  // Binary is overridable for testing / non-standard installs.
+  const bin = process.env.SPOON_CLAUDE_BIN || 'claude'
+
   let child
   try {
-    child = spawn('claude', args, {
+    child = spawn(bin, args, {
       cwd: cwd(),
       env: childEnv,
     })
