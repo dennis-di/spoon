@@ -6,6 +6,7 @@ import type { ResolvedSpoonOptions } from './options.js'
 import { overlayScript } from './overlay/script.js'
 import { detectTailwind } from './tailwind.js'
 import { applyEditAtLocation, type EditOp } from './writeback.js'
+import { runTask, createCheckpoint, restoreCheckpoint, type TaskRequest } from './task.js'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
 
@@ -140,6 +141,49 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
       return
     }
 
+    // Restore a git checkpoint captured before a task (git stash apply <sha>)
+    if (path === '/checkpoint/restore' && req.method === 'POST') {
+      const body = await readBody(req)
+      try {
+        const { ref } = JSON.parse(body)
+        if (!ref) return badRequest(res, 'ref required')
+        const result = await restoreCheckpoint(ref)
+        json(res, result, result.ok ? 200 : 500)
+      } catch {
+        badRequest(res, 'invalid JSON')
+      }
+      return
+    }
+
+    // Claude task: checkpoint then stream the agent's work
+    if (path === '/task' && req.method === 'POST') {
+      const body = await readBody(req)
+      let taskReq: TaskRequest
+      try {
+        taskReq = JSON.parse(body)
+      } catch {
+        return badRequest(res, 'invalid JSON')
+      }
+      if (!taskReq.instruction || !taskReq.file) return badRequest(res, 'instruction and file required')
+
+      // Snapshot before the agent edits, so the whole task is revertible.
+      const cp = await createCheckpoint('spoon-task: ' + taskReq.instruction.slice(0, 50))
+      if (cp.ref) {
+        await appendHistory({
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+          ts: Date.now(),
+          file: taskReq.file,
+          label: 'Checkpoint before task: ' + taskReq.instruction.slice(0, 40),
+          marker: true,
+          checkpoint: cp.ref,
+        } as HistoryEntry)
+      }
+
+      // Streams SSE and ends the response itself.
+      runTask(taskReq, res)
+      return
+    }
+
     res.writeHead(404)
     res.end()
   }
@@ -173,6 +217,8 @@ interface HistoryEntry {
   label: string
   /** True for entries that record a non-write event (checkpoints, comments) */
   marker?: boolean
+  /** git stash sha captured before a task ran, for one-click revert */
+  checkpoint?: string
 }
 
 function summariseLabel(op: EditOp): string {

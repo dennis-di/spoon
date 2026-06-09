@@ -128,13 +128,30 @@ Browser                         Vite dev server                  File system
 
 ---
 
+## AI tasks (Claude)
+
+For changes too complex for direct class/style editing — like rewriting a
+conditional gradient — select an element, open the **✦ Task** tab, and
+describe what you want in plain language ("make the gradient purple instead
+of teal-blue"). Spoon:
+
+1. Takes a git checkpoint (revertible from the History tab)
+2. Runs the `claude` CLI headless, pointed at the exact file + line
+3. Streams the agent's progress live into the panel
+4. HMR reloads the result
+
+Requires the `claude` CLI to be installed and authenticated.
+
 ## Roadmap
 
 - [x] Phase 1: React + Tailwind write-back (classes, text)
-- [ ] Style prop editing
-- [ ] CSS variable / token picker UI
-- [ ] Vue + CSS Modules (Phase 2)
-- [ ] AI-assisted class suggestions ("make this button look more prominent")
+- [x] Visual property editors (spacing box, layout, size)
+- [x] Color tool: tokens, picker, inline-style + gradient awareness
+- [x] Style prop editing (static inline styles)
+- [x] Undo/redo + persistent history + git checkpoints
+- [x] Claude tasks (instruction → agent edit → live stream)
+- [ ] Vue + CSS Modules (Phase 2 stack)
+- [ ] CSS class-rule editing (Webflow-style global class edits)
 - [ ] Multi-element selection
 
 ---

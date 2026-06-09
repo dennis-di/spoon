@@ -356,6 +356,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   function tabBarHtml() {
     return \`<div style="display:flex;background:#11111b;border-bottom:1px solid #313244;flex-shrink:0;">
       \${tabBtn('properties', 'Properties')}
+      \${tabBtn('task',       '✦ Task')}
       \${tabBtn('raw',        'Raw')}
       \${tabBtn('history',    'History')}
     </div>\`;
@@ -563,6 +564,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       return;
     }
     if (state.tab === 'properties') renderPropertiesTab(body, state.currentEl);
+    else if (state.tab === 'task') renderTaskTab(body, state.currentEl);
     else if (state.tab === 'raw') renderRawTab(body, state.currentEl);
   }
 
@@ -1184,6 +1186,164 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     return wrap;
   }
 
+  // ── Task tab (Claude agent) ───────────────────────────────────────────
+
+  function renderTaskTab(body, el) {
+    const wrap = section('✦ Ask Claude to change this', '#6366f1');
+    body.appendChild(wrap);
+
+    const loc = el.dataset.spoonLoc;
+    const ctx = document.createElement('div');
+    ctx.textContent = '<' + el.tagName.toLowerCase() + '> @ ' + (loc || '?');
+    Object.assign(ctx.style, { fontSize: '10px', color: '#6c7086', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' });
+    wrap.appendChild(ctx);
+
+    const ta = document.createElement('textarea');
+    ta.placeholder = 'e.g. "make the gradient purple instead of teal-blue", "make this bigger and bold", "use the primary color"';
+    Object.assign(ta.style, { ...inputStyle(), minHeight: '70px', resize: 'vertical', fontFamily: 'inherit' });
+    if (state._taskDraft) ta.value = state._taskDraft;
+    ta.addEventListener('input', () => { state._taskDraft = ta.value; });
+    wrap.appendChild(ta);
+
+    const ctrlRow = document.createElement('div');
+    Object.assign(ctrlRow.style, { display: 'flex', gap: '6px', alignItems: 'center' });
+
+    const modelSel = document.createElement('select');
+    Object.assign(modelSel.style, selectStyle());
+    for (const m of ['sonnet', 'opus', 'haiku']) {
+      const o = document.createElement('option'); o.value = m; o.textContent = m;
+      if ((state._taskModel || 'sonnet') === m) o.selected = true;
+      modelSel.appendChild(o);
+    }
+    modelSel.addEventListener('change', () => { state._taskModel = modelSel.value; });
+    ctrlRow.appendChild(modelSel);
+
+    const runBtn = document.createElement('button');
+    runBtn.textContent = '▶ Run';
+    Object.assign(runBtn.style, { flex: '1', background: '#6366f1', color: '#fff', border: 'none', borderRadius: '5px', padding: '7px', cursor: 'pointer', fontSize: '12px', fontWeight: '600', fontFamily: 'inherit' });
+    ctrlRow.appendChild(runBtn);
+    wrap.appendChild(ctrlRow);
+
+    const hint = document.createElement('div');
+    hint.textContent = 'A git checkpoint is taken before Claude edits, so you can revert from the History tab.';
+    Object.assign(hint.style, { fontSize: '10px', color: '#585b70' });
+    wrap.appendChild(hint);
+
+    // Output console
+    const out = document.createElement('pre');
+    Object.assign(out.style, {
+      background: '#11111b', border: '1px solid #313244', borderRadius: '6px',
+      padding: '8px', fontSize: '11px', lineHeight: '1.4', color: '#cdd6f4',
+      whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '260px',
+      overflow: 'auto', margin: '0', display: 'none', fontFamily: 'inherit',
+    });
+    wrap.appendChild(out);
+
+    runBtn.onclick = () => runClaudeTask(el, ta.value.trim(), modelSel.value, out, runBtn);
+  }
+
+  function appendOut(out, text, color) {
+    out.style.display = 'block';
+    const span = document.createElement('span');
+    span.textContent = text;
+    if (color) span.style.color = color;
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+  }
+
+  async function runClaudeTask(el, instruction, model, out, runBtn) {
+    if (!instruction) { setStatus('Type an instruction first.'); return; }
+    const loc = el.dataset.spoonLoc;
+    const { file, loc: srcLoc } = parseLoc(loc);
+
+    out.textContent = '';
+    appendOut(out, '✦ Starting Claude (' + model + ')…\n', '#6366f1');
+    runBtn.disabled = true;
+    runBtn.textContent = '… running';
+    runBtn.style.opacity = '0.6';
+
+    try {
+      const res = await fetch(API + '/task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          instruction,
+          file,
+          line: srcLoc.line,
+          loc,
+          html: el.outerHTML.slice(0, 1500),
+          model,
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        appendOut(out, '\\nFailed to start task (HTTP ' + res.status + ')', '#f38ba8');
+        return;
+      }
+
+      // Parse the SSE stream
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split('\\n\\n');
+        buf = frames.pop() ?? '';
+        for (const frame of frames) handleSSEFrame(frame, out);
+      }
+      appendOut(out, '\\n✓ Task finished — HMR will reload changes.\\n', '#a6e3a1');
+      setStatus('✓ Claude task done. Check the result; revert via History if needed.');
+    } catch (err) {
+      appendOut(out, '\\nError: ' + err.message, '#f38ba8');
+    } finally {
+      runBtn.disabled = false;
+      runBtn.textContent = '▶ Run';
+      runBtn.style.opacity = '1';
+    }
+  }
+
+  function handleSSEFrame(frame, out) {
+    let event = 'message', data = '';
+    for (const line of frame.split('\\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data += line.slice(5).trim();
+    }
+    if (!data) return;
+    let parsed;
+    try { parsed = JSON.parse(data); } catch { return; }
+
+    if (event === 'stderr') {
+      // Claude writes some progress to stderr; show dimmed
+      appendOut(out, parsed.text, '#6c7086');
+    } else if (event === 'error') {
+      appendOut(out, '\\n⚠ ' + parsed.message + '\\n', '#f38ba8');
+    } else if (event === 'message') {
+      renderClaudeMessage(parsed, out);
+    } else if (event === 'raw') {
+      appendOut(out, parsed.text + '\\n', '#6c7086');
+    }
+  }
+
+  // Render a claude stream-json message into the console, surfacing assistant
+  // text and tool actions (Edit/Write) so the user sees what's happening.
+  function renderClaudeMessage(msg, out) {
+    if (msg.type === 'assistant' && msg.message?.content) {
+      for (const block of msg.message.content) {
+        if (block.type === 'text' && block.text) {
+          appendOut(out, block.text, '#cdd6f4');
+        } else if (block.type === 'tool_use') {
+          const f = block.input?.file_path || block.input?.path || '';
+          const short = f ? f.split('/').slice(-1)[0] : '';
+          appendOut(out, '\\n  ⚙ ' + block.name + (short ? ' → ' + short : '') + '\\n', '#fab387');
+        }
+      }
+    } else if (msg.type === 'result' && msg.result) {
+      appendOut(out, '\\n' + msg.result + '\\n', '#a6e3a1');
+    }
+  }
+
   // ── Raw tab ───────────────────────────────────────────────────────────
 
   function renderRawTab(body, el) {
@@ -1249,20 +1409,43 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       });
       const time = new Date(e.ts).toLocaleString();
       const fileShort = (e.file || '').split('/').slice(-2).join('/');
+      const isCheckpoint = !!e.checkpoint;
+      if (isCheckpoint) {
+        row.style.borderLeft = '2px solid #6366f1';
+      }
       row.innerHTML = \`
         <div style="display:flex;justify-content:space-between;gap:6px;align-items:baseline">
-          <span style="color:#cdd6f4;font-size:11px;font-weight:600">\${esc(e.label)}</span>
+          <span style="color:#cdd6f4;font-size:11px;font-weight:600">\${isCheckpoint ? '✦ ' : ''}\${esc(e.label)}</span>
           <span style="color:#45475a;font-size:10px">\${esc(time)}</span>
         </div>
-        <div style="color:#6c7086;font-size:10px">\${esc(fileShort)}</div>
+        <div style="color:#6c7086;font-size:10px">\${isCheckpoint ? 'git checkpoint — click to restore working tree' : esc(fileShort)}</div>
       \`;
-      row.title = 'Click to restore the state before this change';
+      row.title = isCheckpoint
+        ? 'Restore the project to this checkpoint (git stash apply)'
+        : 'Click to restore the state before this change';
       row.onclick = () => restoreEntry(e);
       list.appendChild(row);
     }
   }
 
   async function restoreEntry(entry) {
+    // git checkpoint (taken before a Claude task) → restore the whole tree
+    if (entry.checkpoint) {
+      if (!confirm('Restore the project to this checkpoint? This re-applies the snapshot taken before the task ran.')) return;
+      setStatus('Restoring checkpoint…');
+      try {
+        const res = await fetch(API + '/checkpoint/restore', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref: entry.checkpoint }),
+        });
+        const data = await res.json();
+        if (data.ok) setStatus('✓ Checkpoint restored — HMR will reload.');
+        else setStatus('⚠ ' + (data.error ?? 'checkpoint restore failed'));
+      } catch (err) {
+        setStatus('Network error: ' + err.message);
+      }
+      return;
+    }
     if (entry.marker || !entry.inverse || !entry.loc) {
       setStatus('Marker entry — nothing to restore.');
       return;
