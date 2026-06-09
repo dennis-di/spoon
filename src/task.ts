@@ -62,23 +62,31 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
+    // Disable proxy/middleware buffering so frames reach the browser live.
+    'X-Accel-Buffering': 'no',
   })
+  // Flush headers immediately so the browser opens the stream right away.
+  if (typeof (res as any).flushHeaders === 'function') (res as any).flushHeaders()
 
   const send = (event: string, data: unknown) => {
     res.write(`event: ${event}\n`)
     res.write(`data: ${JSON.stringify(data)}\n\n`)
+    // Force a flush if the platform buffers writes.
+    if (typeof (res as any).flush === 'function') (res as any).flush()
   }
 
   // acceptEdits lets Claude apply file edits without interactive prompts, but
   // it still can't run arbitrary destructive shell unless we allow it.
+  // One JSON object per message (system init, each assistant turn, tool
+  // results, final result). We render each as it arrives — no need for
+  // --include-partial-messages (char-by-char deltas), which only adds noise.
   const args = [
     '-p',
     prompt,
     '--output-format',
     'stream-json',
-    '--include-partial-messages',
     '--verbose',
     '--permission-mode',
     'acceptEdits',

@@ -1259,8 +1259,20 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     out.textContent = '';
     appendOut(out, '✦ Starting Claude (' + model + ')…\\n', '#6366f1');
     runBtn.disabled = true;
-    runBtn.textContent = '… running';
     runBtn.style.opacity = '0.6';
+
+    // Live elapsed ticker so the console never looks frozen during the
+    // initial context-load (which can take 10-30s before the first token).
+    const t0 = Date.now();
+    let sawActivity = false;
+    const ticker = setInterval(() => {
+      const secs = Math.floor((Date.now() - t0) / 1000);
+      runBtn.textContent = '… ' + secs + 's';
+      if (!sawActivity && secs >= 3) {
+        // keep the user reassured while Claude reads the project
+        runBtn.title = 'Claude is reading your project (' + secs + 's)…';
+      }
+    }, 1000);
 
     try {
       const res = await fetch(API + '/task', {
@@ -1288,19 +1300,23 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        sawActivity = true;
         buf += decoder.decode(value, { stream: true });
         const frames = buf.split('\\n\\n');
         buf = frames.pop() ?? '';
         for (const frame of frames) handleSSEFrame(frame, out);
       }
-      appendOut(out, '\\n✓ Task finished — HMR will reload changes.\\n', '#a6e3a1');
+      const took = Math.floor((Date.now() - t0) / 1000);
+      appendOut(out, '\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
       setStatus('✓ Claude task done. Check the result; revert via History if needed.');
     } catch (err) {
       appendOut(out, '\\nError: ' + err.message, '#f38ba8');
     } finally {
+      clearInterval(ticker);
       runBtn.disabled = false;
       runBtn.textContent = '▶ Run';
       runBtn.style.opacity = '1';
+      runBtn.title = '';
     }
   }
 
@@ -1326,21 +1342,55 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     }
   }
 
-  // Render a claude stream-json message into the console, surfacing assistant
-  // text and tool actions (Edit/Write) so the user sees what's happening.
+  // Render a claude stream-json message into the console, surfacing what the
+  // agent is actually doing: init, reasoning text, each tool call with a
+  // human-readable summary, tool results, and the final answer.
   function renderClaudeMessage(msg, out) {
+    if (msg.type === 'system' && msg.subtype === 'init') {
+      appendOut(out, '● connected · ' + (msg.model || 'claude') + ' · reading your project…\\n', '#89b4fa');
+      return;
+    }
     if (msg.type === 'assistant' && msg.message?.content) {
       for (const block of msg.message.content) {
-        if (block.type === 'text' && block.text) {
-          appendOut(out, block.text, '#cdd6f4');
+        if (block.type === 'text' && block.text && block.text.trim()) {
+          appendOut(out, '\\n' + block.text.trim() + '\\n', '#cdd6f4');
         } else if (block.type === 'tool_use') {
-          const f = block.input?.file_path || block.input?.path || '';
-          const short = f ? f.split('/').slice(-1)[0] : '';
-          appendOut(out, '\\n  ⚙ ' + block.name + (short ? ' → ' + short : '') + '\\n', '#fab387');
+          appendOut(out, '\\n  ⚙ ' + describeTool(block) + '\\n', '#fab387');
         }
       }
-    } else if (msg.type === 'result' && msg.result) {
-      appendOut(out, '\\n' + msg.result + '\\n', '#a6e3a1');
+      return;
+    }
+    if (msg.type === 'user' && msg.message?.content) {
+      // tool_result blocks — show a short confirmation
+      for (const block of msg.message.content) {
+        if (block.type === 'tool_result') {
+          const ok = !block.is_error;
+          appendOut(out, '    ' + (ok ? '✓ done' : '✗ failed') + '\\n', ok ? '#a6e3a1' : '#f38ba8');
+        }
+      }
+      return;
+    }
+    if (msg.type === 'result') {
+      if (msg.result) appendOut(out, '\\n' + msg.result + '\\n', '#a6e3a1');
+      if (msg.total_cost_usd) {
+        appendOut(out, 'cost: $' + msg.total_cost_usd.toFixed(4) + ' · ' + (msg.num_turns || '?') + ' turns\\n', '#585b70');
+      }
+    }
+  }
+
+  // Human-readable one-liner for a tool_use block.
+  function describeTool(block) {
+    const i = block.input || {};
+    const f = i.file_path || i.path || i.notebook_path || '';
+    const short = f ? f.split('/').slice(-1)[0] : '';
+    switch (block.name) {
+      case 'Read':  return 'reading ' + short;
+      case 'Edit':  return 'editing ' + short;
+      case 'Write': return 'writing ' + short;
+      case 'Grep':  return 'searching for "' + (i.pattern || '') + '"';
+      case 'Glob':  return 'finding files ' + (i.pattern || '');
+      case 'Bash':  return 'running: ' + (i.command || '').slice(0, 50);
+      default:      return block.name + (short ? ' → ' + short : '');
     }
   }
 
