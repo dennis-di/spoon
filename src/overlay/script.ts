@@ -1465,8 +1465,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       const took = Math.floor((Date.now() - state.task.startedAt) / 1000);
       if (state.task.authFail) {
         taskLog('\\n✗ Failed: the claude CLI is not authenticated on this machine.\\n' +
-          '  Open a fresh terminal, run `claude`, and complete /login — then retry.\\n', '#f38ba8');
-        setStatus('⚠ claude CLI not authenticated — run `claude` in a terminal and log in.');
+          '  Open a fresh terminal, run "claude", and complete /login — then retry.\\n', '#f38ba8');
+        setStatus('⚠ claude CLI not authenticated — run "claude" in a terminal and log in.');
       } else if (state.task.exitCode !== undefined && state.task.exitCode !== 0) {
         taskLog('\\n✗ Task failed (exit ' + state.task.exitCode + ') — nothing was changed. See log above.\\n', '#f38ba8');
         setStatus('⚠ Claude task failed — see the log.');
