@@ -93,13 +93,19 @@ export function runTask(req: TaskRequest, res: ServerResponse): void {
   ]
   if (req.model) args.push('--model', req.model)
 
-  // The dev server may itself have been started from inside a Claude Code
-  // session (very common during development), which sets CLAUDECODE et al.
-  // The CLI refuses to launch nested sessions, so strip those markers.
+  // The dev server is often started from inside a Claude Code session or the
+  // desktop app, whose environment leaks session-specific vars: the nested-
+  // session marker (CLAUDECODE), and worse, ANTHROPIC_BASE_URL pointing at an
+  // app-internal proxy the child has no credentials for → opaque 401s.
+  // Strip ALL wrapper vars so the child authenticates exactly like a fresh
+  // terminal (via the user's own `claude` login). ANTHROPIC_API_KEY is kept —
+  // that's legitimate user configuration.
   const childEnv = { ...process.env }
-  delete childEnv.CLAUDECODE
-  delete childEnv.CLAUDE_CODE_SSE_PORT
-  delete childEnv.CLAUDE_CODE_ENTRYPOINT
+  for (const k of Object.keys(childEnv)) {
+    if (/^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_AGENT_|CLAUDE_PREVIEW_)/.test(k)) delete childEnv[k]
+  }
+  delete childEnv.ANTHROPIC_BASE_URL
+  delete childEnv.ANTHROPIC_AUTH_TOKEN
 
   // Binary is overridable for testing / non-standard installs.
   const bin = process.env.SPOON_CLAUDE_BIN || 'claude'

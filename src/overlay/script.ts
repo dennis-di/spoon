@@ -1318,9 +1318,16 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
 
     const modelSel = document.createElement('select');
     Object.assign(modelSel.style, selectStyle());
-    for (const m of ['sonnet', 'opus', 'haiku']) {
-      const o = document.createElement('option'); o.value = m; o.textContent = m;
-      if ((state._taskModel || 'sonnet') === m) o.selected = true;
+    // Aliases resolve to the latest of each family; Fable needs the full id.
+    const MODELS = [
+      ['sonnet', 'sonnet'],
+      ['claude-fable-5', 'fable 5'],
+      ['opus', 'opus'],
+      ['haiku', 'haiku'],
+    ];
+    for (const [val, label] of MODELS) {
+      const o = document.createElement('option'); o.value = val; o.textContent = label;
+      if ((state._taskModel || 'sonnet') === val) o.selected = true;
       modelSel.appendChild(o);
     }
     modelSel.addEventListener('change', () => { state._taskModel = modelSel.value; });
@@ -1456,8 +1463,17 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         for (const frame of frames) handleSSEFrame(frame);
       }
       const took = Math.floor((Date.now() - state.task.startedAt) / 1000);
-      taskLog('\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
-      setStatus('✓ Claude task done. Revert via History if needed.');
+      if (state.task.authFail) {
+        taskLog('\\n✗ Failed: the claude CLI is not authenticated on this machine.\\n' +
+          '  Open a fresh terminal, run `claude`, and complete /login — then retry.\\n', '#f38ba8');
+        setStatus('⚠ claude CLI not authenticated — run `claude` in a terminal and log in.');
+      } else if (state.task.exitCode !== undefined && state.task.exitCode !== 0) {
+        taskLog('\\n✗ Task failed (exit ' + state.task.exitCode + ') — nothing was changed. See log above.\\n', '#f38ba8');
+        setStatus('⚠ Claude task failed — see the log.');
+      } else {
+        taskLog('\\n✓ Done in ' + took + 's — HMR will reload changes.\\n', '#a6e3a1');
+        setStatus('✓ Claude task done. Revert via History if needed.');
+      }
     } catch (err) {
       // AbortError = user pressed Stop; already logged, not a failure.
       if (err.name !== 'AbortError') taskLog('\\nError: ' + err.message + '\\n', '#f38ba8');
@@ -1483,13 +1499,19 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       taskLog('● process started (pid ' + (parsed.pid || '?') + '), loading context…\\n', '#585b70');
     } else if (event === 'stderr') {
       const txt = (parsed.text || '').trim();
-      if (txt) taskLog('  ' + txt + '\\n', '#6c7086');
+      if (txt) {
+        if (/401|authenticat/i.test(txt) && state.task) state.task.authFail = true;
+        taskLog('  ' + txt + '\\n', '#6c7086');
+      }
     } else if (event === 'error') {
       taskLog('\\n⚠ ' + parsed.message + '\\n', '#f38ba8');
     } else if (event === 'message') {
       renderClaudeMessage(parsed);
     } else if (event === 'raw') {
+      if (/401|authenticat/i.test(parsed.text || '') && state.task) state.task.authFail = true;
       taskLog(parsed.text + '\\n', '#6c7086');
+    } else if (event === 'done') {
+      if (state.task) state.task.exitCode = parsed.code ?? 0;
     }
   }
 
