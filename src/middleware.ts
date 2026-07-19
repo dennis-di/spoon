@@ -5,7 +5,7 @@ import { cwd } from 'node:process'
 import type { ResolvedSpoonOptions } from './options.js'
 import { overlayScript } from './overlay/script.js'
 import { detectTailwind } from './tailwind.js'
-import { applyEditAtLocation, type EditOp } from './writeback.js'
+import { applyEditAtLocation, readElementInfo, type EditOp } from './writeback.js'
 import { runTask, createCheckpoint, restoreCheckpoint, type TaskRequest } from './task.js'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -77,6 +77,15 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
           json(res, { ok: true, noop: true })
           return
         }
+
+        // Structural ops (duplicate/remove) shift line numbers, so loc-based
+        // inverse patches can't undo them — take a git checkpoint instead.
+        let checkpoint: string | undefined
+        if (op.element !== undefined) {
+          const cp = await createCheckpoint(`spoon: ${op.element} element in ${file}`)
+          checkpoint = cp.ok ? cp.ref : undefined
+        }
+
         await writeFile(abs, after, 'utf8')
 
         // Build the inverse op so this change can be undone/restored.
@@ -93,13 +102,31 @@ export function createMiddleware(opts: ResolvedSpoonOptions): Handler {
           file,
           loc,
           op,
-          inverse,
+          inverse: op.element !== undefined ? undefined : inverse,
+          checkpoint,
           label: label ?? summariseLabel(op),
         }
         await appendHistory(entry)
         json(res, { ok: true, entry })
       } catch (e) {
         json(res, { error: String(e) }, 500)
+      }
+      return
+    }
+
+    // Source-level element info (className/text as written in the file) —
+    // the overlay's write baseline for components whose DOM classList is merged.
+    if (path === '/element' && req.method === 'GET') {
+      const file = url.searchParams.get('file')
+      const line = Number(url.searchParams.get('line'))
+      const column = Number(url.searchParams.get('column'))
+      if (!file || !Number.isFinite(line)) return badRequest(res, 'file, line, column required')
+      try {
+        const abs = resolve(cwd(), file)
+        const src = await readFile(abs, 'utf8')
+        json(res, readElementInfo(src, line, column))
+      } catch (e) {
+        json(res, { ok: false, error: String(e) }, 500)
       }
       return
     }
@@ -222,6 +249,8 @@ interface HistoryEntry {
 }
 
 function summariseLabel(op: EditOp): string {
+  if (op.element === 'duplicate') return 'Duplicate element'
+  if (op.element === 'remove') return 'Remove element'
   const parts: string[] = []
   if (op.className !== undefined) parts.push('classes')
   if (op.text !== undefined) parts.push('text')

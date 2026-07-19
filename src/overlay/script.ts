@@ -36,6 +36,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     redoStack: [],
     historyOpenCount: 0,
     task: null, // { running, lines, startedAt, instruction, done }
+    // Source-level truth for the selected element: { className: string|null, text }.
+    // For components the DOM classList is the merged runtime list and must
+    // never be written back — writes are computed against this instead.
+    srcInfo: null,
   };
 
   // ── Hotkey parsing — matches on physical e.code so macOS' Alt-letter
@@ -68,12 +72,37 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       return;
     }
     if (!state.active) return;
-    if (e.key === 'Escape') { deactivate(); return; }
+
+    // While the user is typing in any field, keys must behave natively:
+    // Escape just leaves the field, Cmd+Z is the input's own undo.
+    const ae = document.activeElement;
+    const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable);
+
+    if (e.key === 'Escape') {
+      if (typing) { ae.blur(); return; }
+      deactivate();
+      return;
+    }
+    if (typing) return;
 
     // Undo / Redo only while spoon is active so we don't shadow the app's own shortcuts.
     if ((e.metaKey || e.ctrlKey) && e.code === 'KeyZ') {
       e.preventDefault();
       e.shiftKey ? redo() : undo();
+      return;
+    }
+
+    // Element ops on the current selection (Figma-style)
+    if (state.currentEl) {
+      if ((e.metaKey || e.ctrlKey) && e.code === 'KeyD') {
+        e.preventDefault();
+        writeElementOp(state.currentEl, 'duplicate');
+        return;
+      }
+      if (e.key === 'Backspace' || e.key === 'Delete') {
+        e.preventDefault();
+        writeElementOp(state.currentEl, 'remove');
+      }
     }
   });
 
@@ -464,8 +493,10 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     };
     const onBlur = () => finish(true);
     const onKey = (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); el.blur(); }
-      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); el.blur(); }
+      // stopPropagation: without it the document-level handler still sees
+      // Escape after we finish, and closes the whole panel.
+      if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); el.blur(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); finish(false); el.blur(); }
     };
     el.addEventListener('blur', onBlur);
     el.addEventListener('keydown', onKey);
@@ -482,6 +513,16 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     const tn = getTextNode(el);
     if (tn) state.panel.dataset.origText = tn.textContent;
     else delete state.panel.dataset.origText;
+
+    // Fetch the SOURCE className asynchronously — the write baseline.
+    state.srcInfo = null;
+    try {
+      const { file: sf, loc: sl } = parseLoc(el.dataset.spoonLoc);
+      fetch(API + '/element?file=' + encodeURIComponent(sf) + '&line=' + sl.line + '&column=' + sl.column)
+        .then((r) => r.json())
+        .then((d) => { if (state.currentEl === el && d && d.ok) state.srcInfo = d; })
+        .catch(() => {});
+    } catch {}
 
     renderBreadcrumb(el);
     setStatus('');
@@ -644,6 +685,8 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
   };
 
   function renderPropertiesTab(body, el) {
+    // Structural ops first — duplicate/delete the element itself
+    body.appendChild(elementOpsSection(el));
     // Text editor at top, if element has any editable direct text node
     if (getTextNode(el)) {
       body.appendChild(textSection(el));
@@ -660,6 +703,35 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
       if (id === 'color') body.appendChild(colorSection(el));
       else body.appendChild(chipSection(el, id));
     }
+  }
+
+  function elementOpsSection(el) {
+    const wrap = section('Element', '#f38ba8');
+    const row = document.createElement('div');
+    Object.assign(row.style, { display: 'flex', gap: '6px' });
+
+    const dup = document.createElement('button');
+    dup.textContent = '⧉ Duplicate';
+    dup.title = 'Duplicate this element in source (Cmd+D)';
+    Object.assign(dup.style, {
+      flex: '1', background: '#313244', color: '#cdd6f4', border: 'none',
+      borderRadius: '5px', padding: '6px', cursor: 'pointer', fontSize: '11px', fontFamily: 'inherit',
+    });
+    dup.onclick = () => writeElementOp(el, 'duplicate');
+    row.appendChild(dup);
+
+    const del = document.createElement('button');
+    del.textContent = '✕ Delete';
+    del.title = 'Remove this element from source (Backspace)';
+    Object.assign(del.style, {
+      flex: '1', background: '#313244', color: '#f38ba8', border: 'none',
+      borderRadius: '5px', padding: '6px', cursor: 'pointer', fontSize: '11px', fontFamily: 'inherit',
+    });
+    del.onclick = () => writeElementOp(el, 'remove');
+    row.appendChild(del);
+
+    wrap.appendChild(row);
+    return wrap;
   }
 
   function textSection(el) {
@@ -1641,13 +1713,66 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     }
   }
 
+  // Structural element op: duplicate or remove the whole element in source.
+  // Line numbers shift afterwards, so the selection is cleared — the server
+  // takes a git checkpoint first (restorable from the History tab).
+  async function writeElementOp(el, action) {
+    const { file, loc } = parseLoc(el.dataset.spoonLoc);
+    const tag = el.tagName.toLowerCase();
+    setStatus((action === 'duplicate' ? 'Duplicating' : 'Removing') + ' <' + tag + '>…');
+    try {
+      const data = await writeOp(file, loc, { element: action },
+        (action === 'duplicate' ? 'Duplicate' : 'Remove') + ' <' + tag + '>');
+      if (data.ok) {
+        setStatus('✓ ' + (action === 'duplicate' ? 'Duplicated' : 'Removed') + ' <' + tag + '> — re-select after reload. Revert via History.');
+        clearHighlight();
+        state.currentEl = null;
+        state.srcInfo = null;
+        const bc = state.panel.querySelector('#__spoon-breadcrumb');
+        if (bc) bc.innerHTML = '';
+        renderTab();
+      } else {
+        setStatus('⚠ ' + (data.error ?? 'element op failed'));
+      }
+    } catch (err) {
+      setStatus('Network error: ' + err.message);
+    }
+  }
+
   async function applyEdits(el) {
     const { file, loc } = parseLoc(el.dataset.spoonLoc);
     const origClass = state.panel.dataset.origClass ?? '';
     const origText = state.panel.dataset.origText;
 
     const op = {};
-    if (el.className !== origClass) op.className = el.className;
+    if (el.className !== origClass) {
+      const si = state.srcInfo;
+      if (si && typeof si.className === 'string') {
+        // Compute the DOM-level diff (what the user actually changed) and
+        // apply it to the SOURCE class list. Writing el.className directly
+        // would dump the merged runtime list (component-internal classes)
+        // into the file.
+        const before = new Set(origClass.split(/\\s+/).filter(Boolean));
+        const after = classList(el);
+        const afterSet = new Set(after);
+        const removed = [];
+        before.forEach((c) => { if (!afterSet.has(c)) removed.push(c); });
+        const added = after.filter((c) => !before.has(c));
+        const srcList = si.className.split(/\\s+/).filter(Boolean);
+        const merged = srcList.filter((c) => removed.indexOf(c) === -1);
+        for (const a of added) if (merged.indexOf(a) === -1) merged.push(a);
+        const next = merged.join(' ');
+        if (next !== srcList.join(' ')) {
+          op.className = next;
+        } else if (removed.length || added.length) {
+          setStatus('⚠ Those classes come from inside the component, not this source line — nothing to change here.');
+        }
+      } else {
+        // Intrinsic element (DOM equals source) or source not yet known —
+        // fall back to the DOM value; dynamic className is rejected server-side.
+        op.className = el.className;
+      }
+    }
 
     // Text can come from the panel input or from an inline contenteditable edit
     const textInput = state.panel.querySelector('[data-role="text-input"]');
@@ -1669,6 +1794,7 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
         state.redoStack = [];
         // Rebase baselines to the just-saved state
         state.panel.dataset.origClass = el.className;
+        if (op.className !== undefined && state.srcInfo) state.srcInfo.className = op.className;
         if (op.text !== undefined) state.panel.dataset.origText = op.text;
       } else if (data.ok) {
         setStatus('No change needed.');

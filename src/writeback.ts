@@ -16,6 +16,13 @@ export interface EditOp {
    * rejected with a helpful error.
    */
   style?: { prop: string; value: string }
+  /**
+   * Structural op on the whole element: 'duplicate' inserts a copy as the
+   * next sibling, 'remove' deletes it. Only allowed when the element sits
+   * directly in JSX children (not inside {cond && ...} etc., where adding or
+   * removing a sibling would produce invalid code).
+   */
+  element?: 'duplicate' | 'remove'
 }
 
 export interface WriteResult {
@@ -53,6 +60,9 @@ export function applyEditAtLocation(
 
   let openingNode: t.JSXOpeningElement | null = null
   let elementNode: t.JSXElement | null = null
+  // Whether the element sits directly in a JSX children list — the only
+  // context where duplicating/removing keeps the code parseable.
+  let inChildrenList = false
 
   traverse(ast, {
     JSXOpeningElement(path) {
@@ -63,6 +73,8 @@ export function applyEditAtLocation(
         openingNode = path.node
         if (path.parentPath.isJSXElement()) {
           elementNode = path.parentPath.node
+          const gp = path.parentPath.parentPath?.node
+          inChildrenList = t.isJSXElement(gp) || t.isJSXFragment(gp)
         }
         path.stop()
       }
@@ -99,6 +111,41 @@ export function applyEditAtLocation(
     if (r.error) return { ok: false, error: r.error }
     if (r.edit) edits.push(r.edit)
     prevStyle = { prop: op.style.prop, value: r.prev ?? '' }
+  }
+
+  if (op.element !== undefined) {
+    const el = elementNode as t.JSXElement | null
+    if (!el || el.start == null || el.end == null) {
+      return { ok: false, error: 'cannot locate element bounds' }
+    }
+    if (!inChildrenList) {
+      // e.g. {open && <X/>} — a second sibling or an empty && arm won't parse
+      return { ok: false, error: 'element sits inside a JSX expression — duplicating/removing it here would break the code. Edit in source or use a Claude task.' }
+    }
+    const s = el.start
+    const e = el.end
+    const lineStart = source.lastIndexOf('\n', s - 1) + 1
+    const prefix = source.slice(lineStart, s)
+
+    if (op.element === 'duplicate') {
+      // Own-line elements get the copy on a new line with the same indent;
+      // inline elements are duplicated inline.
+      const sep = /^\s*$/.test(prefix) ? '\n' + prefix : ' '
+      edits.push({ start: e, end: e, replacement: sep + source.slice(s, e) })
+    } else if (op.element === 'remove') {
+      const nl = source.indexOf('\n', e)
+      const suffix = nl === -1 ? source.slice(e) : source.slice(e, nl)
+      if (/^\s*$/.test(prefix) && /^\s*$/.test(suffix)) {
+        // Element owns its line(s) — remove the whole line span, one newline included
+        const start = lineStart > 0 ? lineStart - 1 : 0
+        const end = lineStart > 0 ? (nl === -1 ? source.length : nl) : (nl === -1 ? source.length : nl + 1)
+        edits.push({ start, end, replacement: '' })
+      } else {
+        edits.push({ start: s, end: e, replacement: '' })
+      }
+    } else {
+      return { ok: false, error: 'unknown element op' }
+    }
   }
 
   if (edits.length === 0) {
@@ -261,6 +308,68 @@ function classNameEdit(
   }
 
   return { error: 'unsupported className form' }
+}
+
+/**
+ * Read the element's SOURCE-level className and text at a location.
+ * The overlay uses this as the write baseline for components, whose DOM
+ * className is the merged runtime list (e.g. shadcn's cn(...) output) and
+ * must never be written back over the source value.
+ * className: string = static value ('' if attribute missing), null = dynamic.
+ */
+export function readElementInfo(
+  source: string,
+  line: number,
+  column: number,
+): { ok: boolean; className?: string | null; text?: string | null; error?: string } {
+  let ast: ReturnType<typeof parse>
+  try {
+    ast = parse(source, { sourceType: 'module', plugins: ['jsx', 'typescript'] })
+  } catch (e) {
+    return { ok: false, error: 'parse error: ' + String(e) }
+  }
+
+  let opening: t.JSXOpeningElement | null = null
+  let element: t.JSXElement | null = null
+  traverse(ast, {
+    JSXOpeningElement(path) {
+      const loc = path.node.loc
+      if (!loc) return
+      if (loc.start.line === line && loc.start.column === column) {
+        opening = path.node
+        if (path.parentPath.isJSXElement()) element = path.parentPath.node
+        path.stop()
+      }
+    },
+  })
+  if (!opening) return { ok: false, error: `no JSX element at ${line}:${column}` }
+
+  const attr = (opening as t.JSXOpeningElement).attributes.find(
+    (a): a is t.JSXAttribute =>
+      t.isJSXAttribute(a) && t.isJSXIdentifier(a.name) && a.name.name === 'className',
+  )
+  let className: string | null = ''
+  if (attr) {
+    const v = attr.value
+    if (t.isStringLiteral(v)) className = v.value
+    else if (t.isJSXExpressionContainer(v)) {
+      const expr = v.expression
+      if (t.isStringLiteral(expr)) className = expr.value
+      else if (t.isTemplateLiteral(expr) && expr.quasis.length === 1) {
+        className = expr.quasis[0].value.cooked ?? expr.quasis[0].value.raw
+      } else className = null // dynamic (cn(), conditionals)
+    } else className = null
+  }
+
+  let text: string | null = null
+  if (element) {
+    const tc = (element as t.JSXElement).children.filter(
+      (c): c is t.JSXText => t.isJSXText(c) && c.value.trim() !== '',
+    )
+    if (tc.length === 1) text = tc[0].value.trim()
+  }
+
+  return { ok: true, className, text }
 }
 
 function textEdit(
