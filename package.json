@@ -58,11 +58,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/denti-rollmops/spoon.git"
+    "url": "https://github.com/dentirollmops-png/spoon.git"
   },
-  "homepage": "https://github.com/denti-rollmops/spoon#readme",
+  "homepage": "https://github.com/dentirollmops-png/spoon#readme",
   "bugs": {
-    "url": "https://github.com/denti-rollmops/spoon/issues"
+    "url": "https://github.com/dentirollmops-png/spoon/issues"
   },
   "engines": {
     "node": ">=18.0.0"
