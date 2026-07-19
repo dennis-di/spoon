@@ -9,7 +9,7 @@
 
 <!-- TODO: replace with real demo GIF once recorded -->
 <!--
-![spoon demo](https://raw.githubusercontent.com/dentirollmops-png/spoon/main/demo.gif)
+![spoon demo](https://raw.githubusercontent.com/dennis-di/spoon/main/demo.gif)
 -->
 
 ---
@@ -161,7 +161,7 @@ Requires the `claude` CLI to be installed and authenticated.
 PRs welcome. Run `npm run dev` to build in watch mode, then `npm link` and link into a test project.
 
 ```bash
-git clone https://github.com/dentirollmops-png/spoon
+git clone https://github.com/dennis-di/spoon
 cd spoon
 npm install
 npm run dev
