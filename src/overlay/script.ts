@@ -152,6 +152,37 @@ export function overlayScript(opts: ResolvedSpoonOptions): string {
     b.overflowX = ''; b.overflowY = '';
   }
 
+  // ── Focus-trap defense ────────────────────────────────────────────────
+  // Modal libraries (Radix Dialog/Sheet, as used by shadcn) trap focus:
+  // any focus landing outside the open dialog is yanked straight back in,
+  // which made Spoon's inputs untypable while a popup was open. The trap
+  // works via focusin/focusout listeners on document (bubble phase), so we
+  // register CAPTURE-phase guards that swallow focus events involving
+  // Spoon's UI before the trap can see them — capture runs before bubble,
+  // and our listeners are registered at page load, before any dialog
+  // mounts. Spoon has no element-level focus listeners of its own, so
+  // nothing of ours breaks.
+  function inSpoon(n) {
+    return !!(n && n.nodeType === 1 && state.root && state.root.contains(n));
+  }
+  const focusGuard = (e) => {
+    if (inSpoon(e.target) || inSpoon(e.relatedTarget)) e.stopImmediatePropagation();
+  };
+  document.addEventListener('focusin', focusGuard, true);
+  document.addEventListener('focusout', focusGuard, true);
+
+  // Escape typed inside a Spoon field must only blur that field — Radix
+  // listens for Escape on document-capture and would close the app's
+  // dialog. Registered before Radix mounts, so we win the same-phase race.
+  // Other keys pass through untouched so the inputs' own Enter handlers
+  // keep working.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && inSpoon(e.target)) {
+      e.stopImmediatePropagation();
+      if (typeof e.target.blur === 'function') e.target.blur();
+    }
+  }, true);
+
   // ── Lifecycle ─────────────────────────────────────────────────────────
 
   async function activate() {
